@@ -1,0 +1,9 @@
+<launch>
+  <!-- 기존 노드 실행 등 ... -->
+
+  <!-- 카메라 파라미터를 laserMapping 네임스페이스로 로드 -->
+  <rosparam command="load" file="$(find fast_livo2)/config/camera.yaml" />
+
+  <!-- 예시: 노드 실행 -->
+  <node pkg="fast_livo2" type="laser_mapping_node" name="laserMapping" output="screen" />
+</launch> 

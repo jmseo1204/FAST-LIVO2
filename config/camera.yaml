@@ -1,0 +1,58 @@
+# 4개 카메라(cam0~cam3) intrinsic/extrinsic 예시 (항등행렬, 90도 회전)
+laserMapping:
+  cam0:
+    model_type: pinhole
+    fx: 1.0
+    fy: 1.0
+    cx: 0.0
+    cy: 0.0
+    width: 640
+    height: 480
+    distortion: [0, 0, 0, 0, 0]
+    extrinsic:
+      R: [1, 0, 0,
+          0, 1, 0,
+          0, 0, 1]
+      t: [0, 0, 0]
+  cam1:
+    model_type: pinhole
+    fx: 1.0
+    fy: 1.0
+    cx: 0.0
+    cy: 0.0
+    width: 640
+    height: 480
+    distortion: [0, 0, 0, 0, 0]
+    extrinsic:
+      R: [0, -1, 0,
+          1,  0, 0,
+          0,  0, 1]
+      t: [0, 0, 0]
+  cam2:
+    model_type: pinhole
+    fx: 1.0
+    fy: 1.0
+    cx: 0.0
+    cy: 0.0
+    width: 640
+    height: 480
+    distortion: [0, 0, 0, 0, 0]
+    extrinsic:
+      R: [-1, 0, 0,
+           0,-1, 0,
+           0, 0, 1]
+      t: [0, 0, 0]
+  cam3:
+    model_type: pinhole
+    fx: 1.0
+    fy: 1.0
+    cx: 0.0
+    cy: 0.0
+    width: 640
+    height: 480
+    distortion: [0, 0, 0, 0, 0]
+    extrinsic:
+      R: [0, 1, 0,
+         -1, 0, 0,
+          0, 0, 1]
+      t: [0, 0, 0] 

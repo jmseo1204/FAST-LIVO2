@@ -5,10 +5,11 @@ common:
   img_en: 1
   lidar_en: 1
   ros_driver_bug_fix: false
+  show_imu_path: true
 
 extrin_calib:
   extrinsic_T: [-0.006253, 0.011775, -0.03055]
-  extrinsic_R: [-1, 0, 0, 0, -1, 0, 0, 0, -1]
+  extrinsic_R: [-1, 0, 0, 0, -1, 0, 0, 0, 1]
   Rcl: [ 0.00201877838, 0.99999389494, 0.00285212446,
         0.00782156102, 0.00283625306, -0.99996538883,
       -0.99996737333, 0.00204101657, -0.00781578750 ]
@@ -28,13 +29,13 @@ preprocess:
   blind: 1.0
 
 vio: #일단 대충
-  max_iterations: 10
+  max_iterations: 5
   outlier_threshold: 1000 # 78 100 156 #100 200 500 700 infinite
   img_point_cov: 100 # 100 1000 
   patch_size: 8
   patch_pyrimid_level: 3
   normal_en: true
-  raycast_en: false
+  raycast_en: true
   inverse_composition_en: false
   exposure_estimate_en: true
   inv_expo_cov: 0.1
@@ -49,7 +50,7 @@ imu: #일단 ig_lio/config/ncd.yaml 에서 가져옴
   b_gyr_cov: 0.000004
 
 lio:
-  max_iterations: 10
+  max_iterations: 5
   dept_err: 0.02
   beam_err: 0.01
   min_eigen_value: 0.0025 # 0.0025
