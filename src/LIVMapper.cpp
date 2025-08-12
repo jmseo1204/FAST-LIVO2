@@ -47,6 +47,9 @@ LIVMapper::~LIVMapper() {}
 
 void LIVMapper::readParameters(ros::NodeHandle &nh) {
 
+  nh.param<double>("common/lidar_window_size", lidar_window_size, 0.1);
+  nh.param<int>("common/minimum_simultaneous_frame_num",
+                minimum_simultaneous_frame_num, 1);
   nh.param<int>("common/num_of_cam", num_of_cam, 1);
   if (num_of_cam > 1) {
     nh.getParam("common/img_topics", img_topics);
@@ -375,6 +378,15 @@ void LIVMapper::handleVIO() {
     vio_manager->plot_flag = false;
   }
 
+  *pcl_wait_pub += *pcl_w_wait_pub;
+  bool publish_frame = false;
+  if (pub_num == pub_scan_num) {
+    pub_num = 1;
+    publish_frame = true;
+  } else {
+    pub_num++;
+  }
+
   for (size_t i = 0; i < m.imgs.size(); ++i) {
     cv::Mat &current_img = m.imgs[i];
     int cam_idx = m.img_camera_indices[i];
@@ -385,13 +397,18 @@ void LIVMapper::handleVIO() {
     vio_manager->setCameraByIndex(cam_idx);
 
     vio_manager->processFrame(
-        current_img, _pv_list, voxelmap_manager->voxel_map_,
+        current_img, _pv_prev, voxelmap_manager->voxel_map_,
         LidarMeasures.last_lio_update_time - _first_lidar_time);
 
     publish_img_rgb(pubImages[cam_idx], vio_manager);
 
-    publish_frame_world(pubLaserCloudFullRes, vio_manager);
+    publish_frame_world(publish_frame, pubLaserCloudFullRes, vio_manager);
   }
+
+  if (publish_frame) {
+    PointCloudXYZI().swap(*pcl_wait_pub);
+  }
+  PointCloudXYZI().swap(*pcl_w_wait_pub);
 
   if (imu_prop_enable) { // EKF 상태는 LIO 결과로 갱신
     ekf_finish_once = true;
@@ -457,9 +474,15 @@ void LIVMapper::handleLIO() {
 
   double t1 = omp_get_wtime();
 
-  voxelmap_manager->StateEstimation(state_propagat);
+  voxelmap_manager->StateEstimation(state_propagat, LidarMeasures);
   _state = voxelmap_manager->state_;
   _pv_list = voxelmap_manager->pv_list_;
+
+  MeasureGroup &meas = LidarMeasures.measures.back();
+  LidarMeasures.last_lio_update_time = meas.lio_time;
+  std::cout << std::setprecision(7) << std::fixed
+            << "last_lio_update_time updated: "
+            << LidarMeasures.last_lio_update_time << std::endl;
 
   double t2 = omp_get_wtime();
 
@@ -517,7 +540,59 @@ void LIVMapper::handleLIO() {
   }
   voxelmap_manager->UpdateVoxelMap(voxelmap_manager->pv_list_);
   std::cout << "[ LIO ] Update Voxel Map" << std::endl;
+
   _pv_list = voxelmap_manager->pv_list_;
+
+  double min_timestamp = std::numeric_limits<double>::max();
+  double max_timestamp = std::numeric_limits<double>::lowest();
+
+  for (const auto &point : _pv_list) {
+    _pv_prev.insert({point.timestamp, point});
+
+    // timestamp의 최대값과 최소값 업데이트
+    if (point.timestamp < min_timestamp) {
+      min_timestamp = point.timestamp;
+    }
+    if (point.timestamp > max_timestamp) {
+      max_timestamp = point.timestamp;
+    }
+
+    // std::cout << "[Inserted] point.timestamp: " << point.timestamp <<
+    // std::endl;
+  }
+
+  // std::cout << "[Timestamp Range] min: " << min_timestamp
+  //           << ", max: " << max_timestamp << std::endl;
+
+  // std::cout << "[ _pv_prev.size() ] : " << _pv_prev.size() << std::endl;
+
+  // std::cout << "[ _pv_prev.front().timestamp] : " << std::fixed
+  //           << std::setprecision(6) << _pv_prev.begin()->first << std::endl;
+  // std::cout << "[ _pv_prev.back().timestamp] : " << std::fixed
+  //           << std::setprecision(6) << _pv_prev.rbegin()->first << std::endl;
+
+  // std::cout << "[ _pv_prev list ]" << std::endl;
+  // for (int i = 0; i < (5 < _pv_prev.size() ? 5 : _pv_prev.size()); i++) {
+  //   auto it = std::next(_pv_prev.begin(), i);
+  //   std::cout << std::fixed << std::setprecision(6) << it->first << " ";
+  // }
+  // std::cout << std::endl;
+
+  assert(_pv_prev.begin()->first <= _pv_prev.rbegin()->first);
+
+  while (!(_pv_prev.empty() || (_pv_prev.begin()->first + lidar_window_size) >=
+                                   _pv_prev.rbegin()->first)) {
+    // std::cout << "[_pv_prev.front + lidar_window_size] : "
+    //           << _pv_prev.begin()->first + lidar_window_size << " < "
+    //           << _pv_prev.rbegin()->first << std::endl;
+    _pv_prev.erase(_pv_prev.begin());
+  }
+
+  while (!(_pv_prev.empty() || _pv_prev.rbegin()->first < 3000000000.0)) {
+    auto it = _pv_prev.end();
+    --it;
+    _pv_prev.erase(it);
+  }
 
   double t4 = omp_get_wtime();
 
@@ -525,19 +600,34 @@ void LIVMapper::handleLIO() {
     voxelmap_manager->mapSliding();
   }
 
-  PointCloudXYZI::Ptr laserCloudFullRes(dense_map_en ? feats_undistort
-                                                     : feats_down_body);
-  int size = laserCloudFullRes->points.size();
-  PointCloudXYZI::Ptr laserCloudWorld(new PointCloudXYZI(size, 1));
+  // PointCloudXYZI::Ptr laserCloudFullRes(dense_map_en ? feats_undistort
+  //                                                    : feats_down_body);
+  // int size = laserCloudFullRes->points.size();
+  // PointCloudXYZI::Ptr laserCloudWorld(new PointCloudXYZI(size, 1));
 
-  for (int i = 0; i < size; i++) {
-    RGBpointBodyToWorld(&laserCloudFullRes->points[i],
-                        &laserCloudWorld->points[i]);
+  // for (int i = 0; i < size; i++) {
+  //   RGBpointBodyToWorld(&laserCloudFullRes->points[i],
+  //                       &laserCloudWorld->points[i]);
+  // }
+
+  PointCloudXYZI::Ptr laserCloudWorld(new PointCloudXYZI());
+  laserCloudWorld->reserve(_pv_prev.size());
+
+  for (const auto &pair : _pv_prev) {
+    const auto &pv = pair.second;
+    PointType point;
+    point.x = pv.point_w(0);
+    point.y = pv.point_w(1);
+    point.z = pv.point_w(2);
+    // point.intensity = pv.intensity;
+    // point.curvature = pv.timestamp;
+    laserCloudWorld->points.push_back(point);
   }
+
   *pcl_w_wait_pub = *laserCloudWorld;
 
   if (!img_en)
-    publish_frame_world(pubLaserCloudFullRes, vio_manager);
+    publish_frame_world(true, pubLaserCloudFullRes, vio_manager);
   if (pub_effect_point_en)
     publish_effect_world(pubLaserCloudEffect, voxelmap_manager->ptpl_list_);
   if (voxelmap_manager->config_setting_.is_pub_plane_map_)
@@ -782,6 +872,7 @@ void LIVMapper::transformLidar(const Eigen::Matrix3d rot,
     pi.y = p(1);
     pi.z = p(2);
     pi.intensity = p_c.intensity;
+    pi.curvature = p_c.curvature;
     trans_cloud->points.push_back(pi);
   }
 }
@@ -821,6 +912,7 @@ void LIVMapper::RGBpointBodyToWorld(PointType const *const pi,
   po->y = p_global(1);
   po->z = p_global(2);
   po->intensity = pi->intensity;
+  po->curvature = pi->curvature;
 }
 
 void LIVMapper::standard_pcl_cbk(
@@ -1298,7 +1390,7 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas) {
     double time_window = time_window_;
 
     if (meas.last_lio_update_time <= 0.0)
-      meas.last_lio_update_time = lid_header_time_buffer.front();
+      meas.last_lio_update_time = lid_header_time_buffer.front() - 0.00001;
 
     double end_time = min_time_start + time_window;
 
@@ -1311,7 +1403,6 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas) {
     const char block = '#';
     const double time_unit = 0.01; // 0.01초 = 공백 1칸
 
-    // 1. 각 buffer의 front() 가져오기
     vector<double> fronts;
     for (const auto &buf : m_img_time_buffers) {
       if (!buf.empty()) {
@@ -1320,11 +1411,8 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas) {
         fronts.push_back(numeric_limits<double>::max());
       }
     }
-
-    // 2. 최소 timestamp 구하기
     double min_time = *min_element(fronts.begin(), fronts.end());
 
-    // 3. 시각화 출력
     for (size_t i = 0; i < m_img_time_buffers.size(); ++i) {
       size_t size = m_img_time_buffers[i].size();
       if (size == 0) {
@@ -1377,7 +1465,7 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas) {
     if (candidates.empty()) {
       // std::cout << "No Candidates" << std::endl;
       return false;
-    } else if (candidates.size() <= 0) {
+    } else if (candidates.size() < minimum_simultaneous_frame_num) {
       m_img_time_buffers[min_idx].pop_front();
       m_img_buffers[min_idx].pop_front();
       return false;
@@ -1444,38 +1532,75 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas) {
     sig_buffer.notify_all();
 
     *(meas.pcl_proc_cur) = *(meas.pcl_proc_next);
-    PointCloudXYZI().swap(*meas.pcl_proc_next); // pcl_proc_next는 비움
+
+    PointCloudXYZI().swap(*meas.pcl_proc_next);
 
     int lid_frame_num = lid_raw_data_buffer.size();
     int max_size = meas.pcl_proc_cur->size() + 24000 * lid_frame_num;
     meas.pcl_proc_cur->reserve(max_size);
     meas.pcl_proc_next->reserve(max_size);
 
-    // while (meas.pcl_proc_cur->points.front().curvature ){
-    //   meas.pcl_proc_cur->points.pop_front()
-    // }
-
     while (!lid_raw_data_buffer.empty()) {
       if (lid_header_time_buffer.front() > key_frame_time)
         break;
       auto pcl(lid_raw_data_buffer.front()->points);
       double frame_header_time(lid_header_time_buffer.front());
-      float max_offs_time_ms = (m.lio_time - frame_header_time) * 1000.0f;
+      // float max_offs_time_ms = (m.lio_time - frame_header_time) * 1000.0f;
 
       for (int i = 0; i < pcl.size(); i++) {
         auto pt = pcl[i];
-        if (pcl[i].curvature < max_offs_time_ms) {
-          pt.curvature +=
-              (frame_header_time - meas.last_lio_update_time) * 1000.0f;
-          meas.pcl_proc_cur->points.push_back(pt);
-        } else {
-          pt.curvature += (frame_header_time - m.lio_time) * 1000.0f;
-          meas.pcl_proc_next->points.push_back(pt);
-        }
+        // if (pcl[i].curvature < max_offs_time_ms) {
+        //   pt.curvature +=
+        //       (frame_header_time - meas.last_lio_update_time) * 1000.0f;
+        //   meas.pcl_proc_cur->points.push_back(pt);
+
+        //   // pt.curvature += meas.last_lio_update_time * 1000.0f;
+        //   // meas.pcl_proc_prev.push_back(pt);
+        // } else {
+        //   pt.curvature += (frame_header_time - m.lio_time) * 1000.0f;
+        //   meas.pcl_proc_next->points.push_back(pt);
+        // }
+        pt.curvature +=
+            (frame_header_time - meas.last_lio_update_time) * 1000.0f;
+        meas.pcl_proc_cur->points.push_back(pt);
       }
       lid_raw_data_buffer.pop_front();
       lid_header_time_buffer.pop_front();
     }
+
+    // std::sort(
+    //     meas.pcl_proc_cur->points.begin(), meas.pcl_proc_cur->points.end(),
+    //     [](const auto &a, const auto &b) { return a.curvature < b.curvature;
+    //     });
+
+    while (!meas.pcl_proc_cur->points.empty() &&
+           meas.pcl_proc_cur->points.back().curvature >
+               (m.lio_time - meas.last_lio_update_time) * 1000.0f) {
+      auto pt = meas.pcl_proc_cur->points.back();
+      pt.curvature += (meas.last_lio_update_time - m.lio_time) * 1000.0f;
+      meas.pcl_proc_next->points.push_back(pt);
+      meas.pcl_proc_cur->points.pop_back();
+    }
+
+    std::reverse(meas.pcl_proc_next->points.begin(),
+                 meas.pcl_proc_next->points.end());
+
+    std::cout << std::fixed << std::setprecision(6)
+              << "[pcl_proc_cur Timestamp Range] min: "
+              << (double)meas.pcl_proc_cur->points.front().curvature /
+                         (double)1000.0 +
+                     meas.last_lio_update_time
+              << ", max: "
+              << (double)meas.pcl_proc_cur->points.back().curvature /
+                         (double)1000.0 +
+                     meas.last_lio_update_time
+              << std::endl;
+
+    std::cout << meas.pcl_proc_cur->points.back().curvature << " < "
+              << (m.lio_time - meas.last_lio_update_time) * 1000.0f
+              << std::endl;
+    assert(meas.pcl_proc_cur->points.back().curvature <=
+           (m.lio_time - meas.last_lio_update_time) * 1000.0f);
 
     meas.measures.push_back(m);
     meas.lio_vio_flg = LIO;
@@ -1535,16 +1660,14 @@ void LIVMapper::publish_img_rgb(const image_transport::Publisher &pubImage,
   pubImage.publish(out_msg.toImageMsg());
 }
 
-void LIVMapper::publish_frame_world(const ros::Publisher &pubLaserCloudFullRes,
+void LIVMapper::publish_frame_world(bool publish_frame,
+                                    const ros::Publisher &pubLaserCloudFullRes,
                                     VIOManagerPtr vio_manager) {
   if (pcl_w_wait_pub->empty())
     return;
   PointCloudXYZRGB::Ptr laserCloudWorldRGB(new PointCloudXYZRGB());
   if (img_en) {
-    static int pub_num = 1;
-    *pcl_wait_pub += *pcl_w_wait_pub;
-    if (pub_num == pub_scan_num) {
-      pub_num = 1;
+    if (publish_frame) {
       size_t size = pcl_wait_pub->points.size();
       laserCloudWorldRGB->reserve(size);
       // double inv_expo = _state.inv_expo_time;
@@ -1558,8 +1681,11 @@ void LIVMapper::publish_frame_world(const ros::Publisher &pubLaserCloudFullRes,
         V3D p_w(pcl_wait_pub->points[i].x, pcl_wait_pub->points[i].y,
                 pcl_wait_pub->points[i].z);
         V3D pf(vio_manager->new_frame_->w2f(p_w));
+
+        // TODO
         if (pf[2] < 0)
           continue;
+
         V2D pc(vio_manager->new_frame_->w2c(p_w));
 
         if (vio_manager->new_frame_->cam_->isInFrame(pc.cast<int>(), 3)) // 100
@@ -1578,8 +1704,8 @@ void LIVMapper::publish_frame_world(const ros::Publisher &pubLaserCloudFullRes,
             laserCloudWorldRGB->push_back(pointRGB);
         }
       }
-    } else {
-      pub_num++;
+      std::cout << "[CLOUD_REGISTERED] cam_idx: " << vio_manager->cam_idx
+                << std::endl;
     }
   }
 
@@ -1623,7 +1749,7 @@ void LIVMapper::publish_frame_world(const ros::Publisher &pubLaserCloudFullRes,
           pcd_writer.writeBinary(
               all_points_dir,
               *pcl_wait_save); // pcl::io::savePCDFileASCII(all_points_dir,
-                               // *pcl_wait_save);
+          // *pcl_wait_save);
           PointCloudXYZRGB().swap(*pcl_wait_save);
         } else {
           pcd_writer.writeBinary(all_points_dir, *pcl_wait_save_intensity);
@@ -1637,9 +1763,6 @@ void LIVMapper::publish_frame_world(const ros::Publisher &pubLaserCloudFullRes,
       }
     }
   }
-  if (laserCloudWorldRGB->size() > 0)
-    PointCloudXYZI().swap(*pcl_wait_pub);
-  PointCloudXYZI().swap(*pcl_w_wait_pub);
 }
 
 void LIVMapper::publish_visual_sub_map(const ros::Publisher &pubSubVisualMap) {

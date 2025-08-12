@@ -130,7 +130,7 @@ Visualization Manager:
           Position Transformer: XYZ
           Queue Size: 1
           Selectable: false
-          Size (Pixels): 1
+          Size (Pixels): 3
           Size (m): 0.004999999888241291
           Style: Points
           Topic: /cloud_registered

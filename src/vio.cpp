@@ -367,7 +367,7 @@ double VIOManager::calculateNCC(float *ref_patch, float *cur_patch,
 }
 
 void VIOManager::retrieveFromVisualSparseMap(
-    cv::Mat img, vector<pointWithVar> &pg,
+    cv::Mat img, multimap<double, pointWithVar> &pg,
     const unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &plane_map) {
   if (feat_map.size() <= 0)
     return;
@@ -403,10 +403,10 @@ void VIOManager::retrieveFromVisualSparseMap(
 
   // printf("pg size: %zu \n", pg.size());
 
-  for (int i = 0; i < pg.size(); i++) {
+  for (const auto &pair : pg) {
     // double t0 = omp_get_wtime();
 
-    V3D pt_w = pg[i].point_w;
+    V3D pt_w = pair.second.point_w;
 
     for (int j = 0; j < 3; j++) {
       loc_xyz[j] = floor(pt_w[j] / voxel_size);
@@ -824,16 +824,16 @@ void VIOManager::computeJacobianAndUpdateEKF(cv::Mat img) {
 }
 
 void VIOManager::generateVisualMapPoints(cv::Mat img,
-                                         vector<pointWithVar> &pg) {
+                                         multimap<double, pointWithVar> &pg) {
   if (pg.size() <= 10)
     return;
 
   // double t0 = omp_get_wtime();
-  for (int i = 0; i < pg.size(); i++) {
-    if (pg[i].normal == V3D(0, 0, 0))
+  for (const auto &pair : pg) {
+    if (pair.second.normal == V3D(0, 0, 0))
       continue;
 
-    V3D pt = pg[i].point_w;
+    V3D pt = pair.second.point_w;
     V2D pc(new_frame_->w2c(pt));
 
     if (new_frame_->cam_->isInFrame(
@@ -847,7 +847,7 @@ void VIOManager::generateVisualMapPoints(cv::Mat img,
         // if (cur_value < 5) continue;
         if (cur_value > scan_value[index]) {
           scan_value[index] = cur_value;
-          append_voxel_points[index] = pg[i];
+          append_voxel_points[index] = pair.second;
           grid_num[index] = TYPE_POINTCLOUD;
         }
       }
@@ -1626,31 +1626,28 @@ void VIOManager::setCameraByIndex(int index) {
   // this->img_rgb = img.clone();
   // this->img_cp = img.clone();
 
-  cam = m_cameras[index];
-  fx = cam->fx();
-  fy = cam->fy();
-  cx = cam->cx();
-  cy = cam->cy();
-  image_resize_factor = cam->scale();
-  sub_feat_map = sub_feat_maps[index];
+  this->cam = m_cameras[index];
+  this->fx = cam->fx();
+  this->fy = cam->fy();
+  this->cx = cam->cx();
+  this->cy = cam->cy();
+  this->image_resize_factor = cam->scale();
+  this->sub_feat_map = sub_feat_maps[index];
 
-  Rci = m_R_c_i_vec[index];
-  Pci = m_P_c_i_vec[index];
-  Rcl = m_R_c_l_vec[index];
-  Pcl = m_P_c_l_vec[index];
-
-  Rci = Rcl * Rli;
-  Pci = Rcl * Pli + Pcl;
+  this->Rci = m_R_c_i_vec[index];
+  this->Pci = m_P_c_i_vec[index];
+  this->Rcl = m_R_c_l_vec[index];
+  this->Pcl = m_P_c_l_vec[index];
 
   V3D Pic;
   M3D tmp;
-  Jdphi_dR = Rci;
+  this->Jdphi_dR = Rci;
   Pic = -Rci.transpose() * Pci;
   tmp << SKEW_SYM_MATRX(Pic);
-  Jdp_dR = -Rci * tmp;
+  this->Jdp_dR = -Rci * tmp;
 
-  cam_idx = index;
-  sub_feat_map = sub_feat_maps[index];
+  this->cam_idx = index;
+  this->sub_feat_map = sub_feat_maps[index];
 }
 
 void VIOManager::updateState(cv::Mat img, int level) {
@@ -1948,7 +1945,7 @@ void VIOManager::dumpDataForColmap() {
 }
 
 void VIOManager::processFrame(
-    cv::Mat &img, vector<pointWithVar> &pg,
+    cv::Mat &img, multimap<double, pointWithVar> &pg,
     const unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &feat_map,
     double img_time) {
 

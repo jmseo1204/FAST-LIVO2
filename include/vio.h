@@ -149,13 +149,13 @@ public:
   void updateStateInverse(cv::Mat img, int level);
   void updateState(cv::Mat img, int level);
   void
-  processFrame(cv::Mat &img, vector<pointWithVar> &pg,
+  processFrame(cv::Mat &img, multimap<double, pointWithVar> &pg,
                const unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &feat_map,
                double img_time);
   void retrieveFromVisualSparseMap(
-      cv::Mat img, vector<pointWithVar> &pg,
+      cv::Mat img, multimap<double, pointWithVar> &pg,
       const unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &plane_map);
-  void generateVisualMapPoints(cv::Mat img, vector<pointWithVar> &pg);
+  void generateVisualMapPoints(cv::Mat img, multimap<double, pointWithVar> &pg);
   void setImuToLidarExtrinsic(const V3D &transl, const M3D &rot);
   void initializeVIO();
   void getImagePatch(cv::Mat img, V2D pc, float *patch_tmp, int level);

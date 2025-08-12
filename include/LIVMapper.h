@@ -64,7 +64,8 @@ public:
   void img_cbk(const sensor_msgs::ImageConstPtr &msg_in, int cam_idx);
   void publish_img_rgb(const image_transport::Publisher &pubImage,
                        VIOManagerPtr vio_manager);
-  void publish_frame_world(const ros::Publisher &pubLaserCloudFullRes,
+  void publish_frame_world(bool publish_frame,
+                           const ros::Publisher &pubLaserCloudFullRes,
                            VIOManagerPtr vio_manager);
   void publish_visual_sub_map(const ros::Publisher &pubSubVisualMap);
   void publish_effect_world(const ros::Publisher &pubLaserCloudEffect,
@@ -98,6 +99,7 @@ public:
   V3D extT;
   M3D extR;
 
+  double lidar_window_size = 0.1;
   int feats_down_size = 0, max_iterations = 0;
 
   double res_mean_last = 0.05;
@@ -148,6 +150,7 @@ public:
   double plot_time;
   int frame_cnt;
   double img_time_offset = 0.0;
+  int minimum_simultaneous_frame_num = 1;
   deque<PointCloudXYZI::Ptr> lid_raw_data_buffer;
   deque<double> lid_header_time_buffer;
   deque<sensor_msgs::Imu::ConstPtr> imu_buffer;
@@ -173,6 +176,7 @@ public:
   int pub_num = 1;
 
   vector<pointWithVar> _pv_list;
+  multimap<double, pointWithVar> _pv_prev;
   vector<double> extrinT;
   vector<double> extrinR;
   vector<double> cameraextrinT;

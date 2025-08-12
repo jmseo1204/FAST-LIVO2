@@ -80,6 +80,7 @@ struct LidarMeasureGroup {
     this->pcl_proc_cur.reset(new PointCloudXYZI());
     this->pcl_proc_next.reset(new PointCloudXYZI());
     this->measures.clear();
+
     lidar_scan_index_now = 0;
     last_lio_update_time = -1.0;
   };
@@ -94,6 +95,7 @@ typedef struct pointWithVar {
   Eigen::Matrix3d var;
   Eigen::Matrix3d point_crossmat;
   Eigen::Vector3d normal;
+  double timestamp;
   pointWithVar() {
     var_nostate = Eigen::Matrix3d::Zero();
     var = Eigen::Matrix3d::Zero();
@@ -103,7 +105,9 @@ typedef struct pointWithVar {
     point_i = Eigen::Vector3d::Zero();
     point_w = Eigen::Vector3d::Zero();
     normal = Eigen::Vector3d::Zero();
+    timestamp = 0.0;
   };
+
 } pointWithVar;
 
 struct StatesGroup {

@@ -151,7 +151,7 @@ void ImuProcess::Forward_without_imu(LidarMeasureGroup &meas,
   sort(pcl_out.points.begin(), pcl_out.points.end(), time_list);
   const double &pcl_end_time =
       pcl_beg_time + pcl_out.points.back().curvature / double(1000);
-  meas.last_lio_update_time = pcl_end_time;
+  // meas.last_lio_update_time = pcl_end_time;
   const double &pcl_end_offset_time =
       pcl_out.points.back().curvature / double(1000);
 
@@ -276,7 +276,7 @@ void ImuProcess::UpdateStateAndIMUpose(LidarMeasureGroup &lidar_meas,
   // printf("[ IMU ] last propagation end time: %lf \n",
   // lidar_meas.last_lio_update_time);
 
-  if (lidar_meas.lio_vio_flg == LIO) {
+  if (edit_member && lidar_meas.lio_vio_flg == LIO) {
     pcl_wait_proc.resize(lidar_meas.pcl_proc_cur->points.size());
     pcl_wait_proc = *(lidar_meas.pcl_proc_cur);
     lidar_meas.lidar_scan_index_now = 0;
@@ -471,16 +471,12 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas,
   const double prop_end_time =
       lidar_meas.lio_vio_flg == LIO ? meas.lio_time : meas.vio_time;
 
-  lidar_meas.last_lio_update_time = prop_end_time;
-
   V3D acc_imu(acc_s_last), angvel_avr(angvel_last),
       vel_imu(state_inout.vel_end), pos_imu(state_inout.pos_end);
   M3D R_imu(state_inout.rot_end);
 
   double dt = 0;
-  std::cout << std::setprecision(7) << std::fixed
-            << "last_lio_update_time updated: "
-            << lidar_meas.last_lio_update_time << std::endl;
+
   // dt = prop_end_time - imu_end_time;
   // printf("[ LIO Propagation ] dt: %lf \n", dt);
 
@@ -572,6 +568,23 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas,
         it_pcl->y = P_compensate(1);
         it_pcl->z = P_compensate(2);
 
+        if (it_pcl->curvature > 100000.0f) {
+          auto erase_it = it_pcl;
+          it_pcl = pcl_wait_proc.points.erase(erase_it);
+
+          if (it_pcl == pcl_wait_proc.points.begin())
+            break;
+
+          continue;
+        }
+
+        // it_pcl->curvature += lidar_meas.last_lio_update_time * 1000.0f;
+
+        // std::cout << "it_pcl->curvature after: " << std::fixed
+        //           << std::setprecision(6) << it_pcl->curvature << " - "
+        //           << it_pcl->x << " " << it_pcl->y << " " << it_pcl->z
+        //           << std::endl;
+
         if (it_pcl == pcl_wait_proc.points.begin())
           break;
       }
@@ -582,6 +595,10 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas,
   }
   // printf("[ IMU ] time forward: %lf, backward: %lf.\n", t1 - t0,
   // omp_get_wtime() - t1);
+  // lidar_meas.last_lio_update_time = prop_end_time;
+  // std::cout << std::setprecision(7) << std::fixed
+  //           << "last_lio_update_time updated: "
+  //           << lidar_meas.last_lio_update_time << std::endl;
 }
 
 void ImuProcess::Process2(LidarMeasureGroup &lidar_meas, StatesGroup &stat,
@@ -598,9 +615,6 @@ void ImuProcess::Process2(LidarMeasureGroup &lidar_meas, StatesGroup &stat,
   MeasureGroup &meas = lidar_meas.measures.back();
 
   if (imu_need_init) {
-    double pcl_end_time =
-        lidar_meas.lio_vio_flg == LIO ? meas.lio_time : meas.vio_time;
-    // lidar_meas.last_lio_update_time = pcl_end_time;
 
     if (meas.imu.empty()) {
       return;
