@@ -507,22 +507,6 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas,
   last_imu = v_imu.back();
   last_prop_end_time = prop_end_time;
 
-  // auto pos_liD_e = state_inout.pos_end + state_inout.rot_end *
-  // Lid_offset_to_IMU; auto R_liD_e   = state_inout.rot_end * Lidar_R_to_IMU;
-
-  // cout<<"[ IMU ]: vel "<<state_inout.vel_end.transpose()<<" pos
-  // "<<state_inout.pos_end.transpose()<<"
-  // ba"<<state_inout.bias_a.transpose()<<" bg
-  // "<<state_inout.bias_g.transpose()<<endl; cout<<"propagated cov:
-  // "<<state_inout.cov.diagonal().transpose()<<endl;
-
-  //   cout<<"UndistortPcl Time:";
-  //   for (auto it = IMUpose.begin(); it != IMUpose.end(); ++it) {
-  //     cout<<it->offset_time<<" ";
-  //   }
-  //   cout<<endl<<"UndistortPcl size:"<<IMUpose.size()<<endl;
-  //   cout<<"Undistorted pcl_out.size: "<<pcl_out.size()
-  //          <<"lidar_meas.size: "<<lidar_meas.lidar->points.size()<<endl;
   if (pcl_wait_proc.points.size() < 1)
     return;
 
@@ -541,10 +525,6 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas,
       vel_imu << VEC_FROM_ARRAY(head->vel);
       pos_imu << VEC_FROM_ARRAY(head->pos);
       angvel_avr << VEC_FROM_ARRAY(head->gyr);
-
-      // printf("head->offset_time: %lf \n", head->offset_time);
-      // printf("it_pcl->curvature: %lf pt dt: %lf \n", it_pcl->curvature,
-      // it_pcl->curvature / double(1000) - head->offset_time);
 
       for (; it_pcl->curvature / double(1000) > head->offset_time; it_pcl--) {
         dt = it_pcl->curvature / double(1000) - head->offset_time;
@@ -578,27 +558,17 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas,
           continue;
         }
 
-        // it_pcl->curvature += lidar_meas.last_lio_update_time * 1000.0f;
-
-        // std::cout << "it_pcl->curvature after: " << std::fixed
-        //           << std::setprecision(6) << it_pcl->curvature << " - "
-        //           << it_pcl->x << " " << it_pcl->y << " " << it_pcl->z
-        //           << std::endl;
-
         if (it_pcl == pcl_wait_proc.points.begin())
           break;
       }
     }
     pcl_out = pcl_wait_proc;
     pcl_wait_proc.clear();
-    IMUpose.clear();
+    if (IMUpose.size() > 0) {
+      IMUpose_cp = IMUpose;
+      IMUpose.clear();
+    }
   }
-  // printf("[ IMU ] time forward: %lf, backward: %lf.\n", t1 - t0,
-  // omp_get_wtime() - t1);
-  // lidar_meas.last_lio_update_time = prop_end_time;
-  // std::cout << std::setprecision(7) << std::fixed
-  //           << "last_lio_update_time updated: "
-  //           << lidar_meas.last_lio_update_time << std::endl;
 }
 
 void ImuProcess::Process2(LidarMeasureGroup &lidar_meas, StatesGroup &stat,

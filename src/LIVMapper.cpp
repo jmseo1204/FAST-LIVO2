@@ -47,6 +47,7 @@ LIVMapper::~LIVMapper() {}
 
 void LIVMapper::readParameters(ros::NodeHandle &nh) {
 
+  nh.param<bool>("common/en_cam_backprop", en_cam_backprop, false);
   nh.param<double>("common/lidar_window_size", lidar_window_size, 0.1);
   nh.param<int>("common/minimum_simultaneous_frame_num",
                 minimum_simultaneous_frame_num, 1);
@@ -368,6 +369,8 @@ void LIVMapper::handleVIO() {
     return;
   }
 
+  const auto &imu_poses = p_imu->IMUpose_cp;
+
   std::cout << "[ VIO ] Raw feature num: " << pcl_w_wait_pub->points.size()
             << std::endl;
 
@@ -394,8 +397,11 @@ void LIVMapper::handleVIO() {
     std::cout << "[ VIO ] Processing for camera index: " << cam_idx
               << std::endl;
 
-    vio_manager->setCameraByIndex(cam_idx);
-
+    if (en_cam_backprop) {
+      vio_manager->compensateExtrinsicsByTimeOffset(imu_poses, cam_idx);
+    } else {
+      vio_manager->setCameraByIndex(cam_idx);
+    }
     vio_manager->processFrame(
         current_img, _pv_prev, voxelmap_manager->voxel_map_,
         LidarMeasures.last_lio_update_time - _first_lidar_time);
@@ -403,6 +409,8 @@ void LIVMapper::handleVIO() {
     publish_img_rgb(pubImages[cam_idx], vio_manager);
 
     publish_frame_world(publish_frame, pubLaserCloudFullRes, vio_manager);
+
+    vio_manager->restoreOriginalExtrinsics();
   }
 
   if (publish_frame) {
@@ -1127,7 +1135,6 @@ void LIVMapper::img_cbk(const sensor_msgs::ImageConstPtr &msg_in, int cam_idx) {
 //       meas.lidar_frame_end_time =
 //           meas.lidar_frame_beg_time +
 //           meas.lidar->points.back().curvature / double(1000); // calc lidar
-//           scan
 //       meas.pcl_proc_cur = meas.lidar;
 //       lidar_pushed = true; // flag
 //     }
@@ -1432,15 +1439,9 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas) {
 
     int min_idx = -1;
     for (int i = 0; i < num_of_cam; i++) {
-      // DEBUG
-      // if (i > 0)
-      //   continue;
-
       if (m_img_time_buffers[i].empty()) {
         std::cout << "channel pass(empty): " << i << std::endl;
       }
-      // std::cout << "[DEBUG] channel: " << i << " "
-      //           << m_img_time_buffers[i].front() << std::endl;
 
       double current_img_time = m_img_time_buffers[i].front();
 
@@ -1463,9 +1464,10 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas) {
     }
 
     if (candidates.empty()) {
-      // std::cout << "No Candidates" << std::endl;
+      std::cout << "No Candidates" << std::endl;
       return false;
     } else if (candidates.size() < minimum_simultaneous_frame_num) {
+      std::cout << "Below minimum Candidates" << std::endl;
       m_img_time_buffers[min_idx].pop_front();
       m_img_buffers[min_idx].pop_front();
       return false;
@@ -1478,6 +1480,16 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas) {
 
     std::cout << "candidates: " << candidates.size() << std::endl;
 
+    std::map<int, double> time_offsets_from_last_update;
+    for (const auto &cand : m_candidates) {
+      int cam_idx = cand.first;
+      double capture_time = cand.second.first;
+      // last_lio_update_time으로부터 각 이미지 캡처 시간까지의 시간 간격을 저장
+      time_offsets_from_last_update[cam_idx] =
+          capture_time - meas.last_lio_update_time;
+    }
+    vio_manager->setCameraTimeOffsets(time_offsets_from_last_update);
+
     meas.measures.clear();
 
     double lid_newest_time =
@@ -1487,14 +1499,14 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas) {
 
     if (key_frame_time > lid_newest_time) {
       std::cout << std::fixed << std::setprecision(6)
-                << "[sync false] lid < key_frame: " << lid_newest_time << " < "
+                << "[sync false] lid < key_frame: " << lid_newest_time << "<"
                 << key_frame_time << std::endl;
       return false;
     }
 
     if (key_frame_time > imu_newest_time) {
       std::cout << std::fixed << std::setprecision(6)
-                << "[sync false] IMU < key_frame: " << imu_newest_time << " < "
+                << "[sync false] IMU < key_frame: " << imu_newest_time << "<"
                 << key_frame_time << std::endl;
       return false;
     }
@@ -1545,21 +1557,9 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas) {
         break;
       auto pcl(lid_raw_data_buffer.front()->points);
       double frame_header_time(lid_header_time_buffer.front());
-      // float max_offs_time_ms = (m.lio_time - frame_header_time) * 1000.0f;
 
       for (int i = 0; i < pcl.size(); i++) {
         auto pt = pcl[i];
-        // if (pcl[i].curvature < max_offs_time_ms) {
-        //   pt.curvature +=
-        //       (frame_header_time - meas.last_lio_update_time) * 1000.0f;
-        //   meas.pcl_proc_cur->points.push_back(pt);
-
-        //   // pt.curvature += meas.last_lio_update_time * 1000.0f;
-        //   // meas.pcl_proc_prev.push_back(pt);
-        // } else {
-        //   pt.curvature += (frame_header_time - m.lio_time) * 1000.0f;
-        //   meas.pcl_proc_next->points.push_back(pt);
-        // }
         pt.curvature +=
             (frame_header_time - meas.last_lio_update_time) * 1000.0f;
         meas.pcl_proc_cur->points.push_back(pt);
@@ -1567,11 +1567,6 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas) {
       lid_raw_data_buffer.pop_front();
       lid_header_time_buffer.pop_front();
     }
-
-    // std::sort(
-    //     meas.pcl_proc_cur->points.begin(), meas.pcl_proc_cur->points.end(),
-    //     [](const auto &a, const auto &b) { return a.curvature < b.curvature;
-    //     });
 
     while (!meas.pcl_proc_cur->points.empty() &&
            meas.pcl_proc_cur->points.back().curvature >

@@ -68,6 +68,8 @@ public:
   M3D Eye3d;
   V3D Zero3d;
   int lidar_type;
+  vector<Pose6D> IMUpose;
+  vector<Pose6D> IMUpose_cp;
 
 private:
   void IMU_init(const MeasureGroup &meas, StatesGroup &state, int &N);
@@ -76,7 +78,6 @@ private:
   PointCloudXYZI pcl_wait_proc;
   sensor_msgs::ImuConstPtr last_imu;
   PointCloudXYZI::Ptr cur_pcl_un_;
-  vector<Pose6D> IMUpose;
   M3D Lid_rot_to_IMU;
   V3D Lid_offset_to_IMU;
   V3D mean_acc;

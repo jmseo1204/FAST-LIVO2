@@ -99,6 +99,7 @@ public:
   V3D extT;
   M3D extR;
 
+  bool en_cam_backprop = false;
   double lidar_window_size = 0.1;
   int feats_down_size = 0, max_iterations = 0;
 

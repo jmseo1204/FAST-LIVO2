@@ -13,9 +13,10 @@ common:
   img_en: 1
   lidar_en: 1
   ros_driver_bug_fix: false
-  sync_time_window: 0.01
-  minimum_simultaneous_frame_num: 1
+  sync_time_window: 0.08
+  minimum_simultaneous_frame_num: 2
   lidar_window_size: 0.1
+  en_cam_backprop: true
 
 extrin_calib:
   # LiDAR to IMU Extrinsics (T_il)

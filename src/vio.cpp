@@ -1615,17 +1615,6 @@ void VIOManager::setCameraByIndex(int index) {
     return;
   }
 
-  // if (width != img.cols || height != img.rows) {
-  //   if (img.empty())
-  //     printf("[ VIO ] Empty Image!\n");
-  //   cv::resize(img, img,
-  //              cv::Size(img.cols * image_resize_factor,
-  //                       img.rows * image_resize_factor),
-  //              0, 0, CV_INTER_LINEAR);
-  // }
-  // this->img_rgb = img.clone();
-  // this->img_cp = img.clone();
-
   this->cam = m_cameras[index];
   this->fx = cam->fx();
   this->fy = cam->fy();
@@ -2072,4 +2061,112 @@ void VIOManager::processFrame(
   // cv::Scalar(255, 255, 255), 1, 8, 0);
   // cv::imwrite("/home/chunran/Desktop/raycasting/" +
   // std::to_string(new_frame_->id_) + ".png", img_cp);
+}
+
+// sync_packages에서 계산된 시간 오프셋을 VIOManager로 전달하는 함수
+void VIOManager::setCameraTimeOffsets(
+    const std::map<int, double> &time_offsets) {
+  m_img_time_offsets_from_last_update.assign(m_cameras.size(), 0.0);
+  for (const auto &pair : time_offsets) {
+    int cam_idx = pair.first;
+    double offset = pair.second;
+    if (cam_idx < m_img_time_offsets_from_last_update.size()) {
+      m_img_time_offsets_from_last_update[cam_idx] = offset;
+    }
+  }
+}
+
+// 원본 외향 매개변수를 백업하는 함수
+void VIOManager::backupOriginalExtrinsics() {
+  original_Rci = this->Rci;
+  original_Pci = this->Pci;
+  original_Rcl = this->Rcl;
+  original_Pcl = this->Pcl;
+  original_Jdphi_dR = this->Jdphi_dR;
+  original_Jdp_dR = this->Jdp_dR;
+}
+
+// 백업된 원본 외향 매개변수로 복원하는 함수
+void VIOManager::restoreOriginalExtrinsics() {
+  this->Rci = original_Rci;
+  this->Pci = original_Pci;
+  this->Rcl = original_Rcl;
+  this->Pcl = original_Pcl;
+  this->Jdphi_dR = original_Jdphi_dR;
+  this->Jdp_dR = original_Jdp_dR;
+}
+
+void VIOManager::compensateExtrinsicsByTimeOffset(
+    const std::vector<Pose6D> &imu_poses, int cam_idx) {
+  setCameraByIndex(cam_idx);
+
+  double target_offset_time = m_img_time_offsets_from_last_update[cam_idx];
+
+  const auto &pose_at_kf = imu_poses.back();
+  M3D R_at_kf;
+  R_at_kf << MAT_FROM_ARRAY(pose_at_kf.rot);
+  V3D P_at_kf;
+  P_at_kf << VEC_FROM_ARRAY(pose_at_kf.pos);
+
+  if ((target_offset_time - pose_at_kf.offset_time) > -1e-6) {
+    std::cout << "[ DEBUG ] cam" << cam_idx << " is not compensated"
+              << std::endl;
+    return;
+  }
+
+  auto it_kp = imu_poses.end() - 1;
+  for (; it_kp != imu_poses.begin(); it_kp--) {
+    if (it_kp->offset_time < target_offset_time) {
+      break;
+    }
+  }
+  std::cout << "[ DEBUG ] cam" << cam_idx
+            << " IMUpose length: " << imu_poses.end() - 1 - it_kp << std::endl;
+
+  auto head = it_kp;
+  auto tail = it_kp + 1;
+
+  double dt = target_offset_time - head->offset_time;
+  double head_tail_dt = tail->offset_time - head->offset_time;
+  double s = dt / head_tail_dt;
+
+  M3D R_at_head;
+  R_at_head << MAT_FROM_ARRAY(head->rot);
+  V3D P_at_head;
+  P_at_head << VEC_FROM_ARRAY(head->pos);
+  M3D R_at_tail;
+  R_at_tail << MAT_FROM_ARRAY(tail->rot);
+  V3D P_at_tail;
+  P_at_tail << VEC_FROM_ARRAY(tail->pos);
+
+  M3D R_at_img_time = Eigen::Quaterniond(R_at_head)
+                          .slerp(s, Eigen::Quaterniond(R_at_tail))
+                          .toRotationMatrix();
+  V3D P_at_img_time = (1.0 - s) * P_at_head + s * P_at_tail;
+
+  M3D R_w_kf = R_at_kf;
+  V3D P_w_kf = P_at_kf;
+  M3D R_w_img = R_at_img_time;
+  V3D P_w_img = P_at_img_time;
+
+  M3D R_kf_img = R_w_kf.transpose() * R_w_img;
+  V3D P_kf_img = R_w_kf.transpose() * (P_w_img - P_w_kf);
+
+  backupOriginalExtrinsics();
+
+  M3D R_img_kf = R_kf_img.transpose();
+  V3D P_img_kf = -R_img_kf * P_kf_img;
+
+  this->Rci = original_Rci * R_img_kf;
+  this->Pci = original_Rci * P_img_kf + original_Pci;
+
+  this->Rcl = Rci * Rli.transpose();
+  this->Pcl = Pci + Rci * (-Rli.transpose() * Pli);
+
+  V3D Pic;
+  M3D tmp;
+  this->Jdphi_dR = this->Rci;
+  Pic = -this->Rci.transpose() * this->Pci;
+  tmp << SKEW_SYM_MATRX(Pic);
+  this->Jdp_dR = -this->Rci * tmp;
 }

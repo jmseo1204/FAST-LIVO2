@@ -89,6 +89,18 @@ public:
   int cam_idx;
   vector<unordered_map<VOXEL_LOCATION, int> *> sub_feat_maps;
 
+  std::vector<double> m_img_time_offsets_from_last_update;
+
+  M3D original_Rci, original_Rcl;
+  V3D original_Pci, original_Pcl;
+  M3D original_Jdphi_dR, original_Jdp_dR;
+
+  void setCameraTimeOffsets(const std::map<int, double> &time_offsets);
+  void compensateExtrinsicsByTimeOffset(const std::vector<Pose6D> &imu_poses,
+                                        int cam_idx);
+  void backupOriginalExtrinsics();
+  void restoreOriginalExtrinsics();
+
   void setCameraByIndex(int index);
   void setLidarToCameraExtrinsic(vector<double> &R, vector<double> &P);
   void setExtrinsicParameters(const M3D &R_li, const V3D &P_li,
