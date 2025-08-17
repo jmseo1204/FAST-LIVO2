@@ -37,6 +37,10 @@ vio:
   inverse_composition_en: false
   exposure_estimate_en: true
   inv_expo_cov: 0.1
+  
+  shiTomasiScore_threshold: 150.0
+  min_depth_threshold: 1.1
+  max_depth_threshold: 20.0
 
 imu:
   imu_en: true

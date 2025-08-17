@@ -14,7 +14,9 @@ which is included as part of this source code package.
 #define VIO_H_
 
 #include "feature.h"
+#include "utils/types.h"
 #include "voxel_map.h"
+#include <cmath>
 #include <opencv2/imgproc/imgproc_c.h>
 #include <pcl/filters/voxel_grid.h>
 #include <set>
@@ -131,6 +133,11 @@ public:
 
   double img_point_cov, outlier_threshold, ncc_thre;
 
+  // VIO 파라미터들
+  float shiTomasiScore_threshold;
+  float min_depth_threshold;
+  float max_depth_threshold;
+
   SubSparseMap *visual_submap;
   std::vector<std::vector<V3D>> rays_with_sample_points;
 
@@ -158,6 +165,15 @@ public:
 
   VIOManager();
   ~VIOManager();
+  void readParameters(ros::NodeHandle &nh);
+
+  // 헬퍼 함수들
+  float computeMultiScaleScore(const V2D &pc,
+                               const std::vector<cv::Mat> &pyramid_images,
+                               double depth);
+  bool processVisualPoint(const V3D &pt, const pointWithVar &point_data,
+                          const std::vector<cv::Mat> &pyramid_images);
+
   void updateStateInverse(cv::Mat img, int level);
   void updateState(cv::Mat img, int level);
   void

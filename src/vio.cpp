@@ -16,6 +16,88 @@ VIOManager::VIOManager() {
   // downSizeFilter.setLeafSize(0.2, 0.2, 0.2);
 }
 
+void VIOManager::readParameters(ros::NodeHandle &nh) {
+  // VIO 관련 파라미터들
+  nh.param<float>("vio/shiTomasiScore_threshold", shiTomasiScore_threshold,
+                  150.0);
+  nh.param<float>("vio/min_depth_threshold", min_depth_threshold, 1.5);
+  nh.param<float>("vio/max_depth_threshold", max_depth_threshold, 10.0);
+
+  ROS_INFO("VIO Parameters loaded - shiTomasiScore_threshold: %.1f, "
+           "min_depth_threshold: %.1f, max_depth_threshold: %.1f",
+           shiTomasiScore_threshold, min_depth_threshold, max_depth_threshold);
+}
+
+float VIOManager::computeMultiScaleScore(
+    const V2D &pc, const std::vector<cv::Mat> &pyramid_images, double depth) {
+  float multi_scale_score = 0.f;
+  V2D pc_level = pc;
+  const int PYRAMID_LEVELS = pyramid_images.size();
+
+  for (int level = 0; level < PYRAMID_LEVELS; ++level) {
+    const cv::Mat &current_img = pyramid_images[level];
+
+    if (pc_level.x() >= 0 && pc_level.x() < current_img.cols &&
+        pc_level.y() >= 0 && pc_level.y() < current_img.rows) {
+
+      float score_at_level =
+          vk::shiTomasiScore(current_img, pc_level.x(), pc_level.y());
+
+      // 첫 번째 루프와 두 번째 루프에서 가중치 계산 방식이 다름
+      double huristic_reference_depth = 2.0;
+      float weight =
+          std::pow(huristic_reference_depth / depth, level) /
+          ((std::pow(huristic_reference_depth / depth, PYRAMID_LEVELS) - 1) /
+           (huristic_reference_depth / depth - 1));
+      multi_scale_score += weight * score_at_level;
+    }
+
+    pc_level /= 2.0;
+  }
+
+  return multi_scale_score;
+}
+
+bool VIOManager::processVisualPoint(
+    const V3D &pt, const pointWithVar &point_data,
+    const std::vector<cv::Mat> &pyramid_images) {
+  V2D pc(new_frame_->w2c(pt));
+
+  if (!new_frame_->cam_->isInFrame(pc.cast<int>(), border)) {
+    return false;
+  }
+
+  V3D dir(new_frame_->T_f_w_ * pt);
+
+  double depth = dir[2];
+
+  if (depth < min_depth_threshold || depth > max_depth_threshold) {
+    return false;
+  }
+
+  int index = static_cast<int>(pc[1] / grid_size) * grid_n_width +
+              static_cast<int>(pc[0] / grid_size);
+
+  if (grid_num[index] == TYPE_MAP) {
+    return false;
+  }
+
+  float multi_scale_score = computeMultiScaleScore(pc, pyramid_images, depth);
+
+  if (multi_scale_score < shiTomasiScore_threshold) {
+    return false;
+  }
+
+  if (multi_scale_score > scan_value[index]) {
+    scan_value[index] = multi_scale_score;
+    append_voxel_points[index] = point_data;
+    grid_num[index] = TYPE_POINTCLOUD;
+    return true;
+  }
+
+  return false;
+}
+
 VIOManager::~VIOManager() {
   delete visual_submap;
   for (auto &pair : warp_map)
@@ -828,51 +910,82 @@ void VIOManager::generateVisualMapPoints(cv::Mat img,
   if (pg.size() <= 10)
     return;
 
+  // std::cout << "[ DEBUG ] generateVisualMapPoints" << std::endl;
+
+  cv::Mat gray_img;
+  cv::Mat h_channel, v_channel;
+  cv::Mat h_cos, h_sin;
+  cv::Mat h_grad_x_cos, h_grad_y_cos, h_grad_x_sin, h_grad_y_sin;
+
+  if (img.channels() == 3) {
+    cv::cvtColor(img, gray_img, CV_BGR2GRAY);
+
+    cv::Mat hsv_img;
+    cv::cvtColor(img, hsv_img, CV_BGR2HSV);
+
+    std::vector<cv::Mat> hsv_channels;
+    cv::split(hsv_img, hsv_channels);
+    h_channel = hsv_channels[0];
+    v_channel = hsv_channels[2];
+
+    cv::Mat h_angle;
+
+    // std::cout << "[ DEBUG ] generateVisualMapPoints 1" << std::endl;
+    h_channel.convertTo(h_angle, CV_32F,
+                        2.0 * CV_PI / 180.0); // OpenCV H는 0-179 범위
+
+    // std::cout << "[ DEBUG ] generateVisualMapPoints 2" << std::endl;
+    h_cos.create(h_angle.size(), h_angle.type());
+    h_sin.create(h_angle.size(), h_angle.type());
+
+    for (int r = 0; r < h_angle.rows; ++r) {
+      const float *p_angle = h_angle.ptr<float>(r);
+      float *p_cos = h_cos.ptr<float>(r);
+      float *p_sin = h_sin.ptr<float>(r);
+      for (int c = 0; c < h_angle.cols; ++c) {
+        p_cos[c] = std::cos(p_angle[c]);
+        p_sin[c] = std::sin(p_angle[c]);
+      }
+    }
+    // std::cout << "[ DEBUG ] generateVisualMapPoints 3" << std::endl;
+
+    cv::Sobel(h_cos, h_grad_x_cos, CV_32F, 1, 0, 3);
+    cv::Sobel(h_cos, h_grad_y_cos, CV_32F, 0, 1, 3);
+    cv::Sobel(h_sin, h_grad_x_sin, CV_32F, 1, 0, 3);
+    cv::Sobel(h_sin, h_grad_y_sin, CV_32F, 0, 1, 3);
+  } else {
+    gray_img = img.clone();
+  }
+
+  const int PYRAMID_LEVELS = 3;
+  std::vector<cv::Mat> pyramid_images;
+  pyramid_images.push_back(gray_img);
+  for (int i = 1; i < PYRAMID_LEVELS; ++i) {
+    cv::Mat downsampled_img;
+    cv::pyrDown(pyramid_images.back(), downsampled_img);
+    // cv::pyrDown(downsampled_img, downsampled_img);
+    pyramid_images.push_back(downsampled_img);
+  }
+
+  // float hue_threshold = 11;
+  // float shiTomasiScore_threshold = 150.0;  // 이제 멤버 변수로 사용
+  // float min_depth_threshold = 1.5;          // 이제 멤버 변수로 사용
+  // float max_depth_threshold = 10.0;         // 이제 멤버 변수로 사용
+
+  // float weight_hue = 0.5;
+
+  // std::cout << "[ DEBUG ] generateVisualMapPoints 4" << std::endl;
   // double t0 = omp_get_wtime();
   for (const auto &pair : pg) {
     if (pair.second.normal == V3D(0, 0, 0))
       continue;
 
-    V3D pt = pair.second.point_w;
-    V2D pc(new_frame_->w2c(pt));
-
-    if (new_frame_->cam_->isInFrame(
-            pc.cast<int>(), border)) // 20px is the patch size in the matcher
-    {
-      int index = static_cast<int>(pc[1] / grid_size) * grid_n_width +
-                  static_cast<int>(pc[0] / grid_size);
-
-      if (grid_num[index] != TYPE_MAP) {
-        float cur_value = vk::shiTomasiScore(img, pc[0], pc[1]);
-        // if (cur_value < 5) continue;
-        if (cur_value > scan_value[index]) {
-          scan_value[index] = cur_value;
-          append_voxel_points[index] = pair.second;
-          grid_num[index] = TYPE_POINTCLOUD;
-        }
-      }
-    }
+    processVisualPoint(pair.second.point_w, pair.second, pyramid_images);
   }
 
   for (int j = 0; j < visual_submap->add_from_voxel_map.size(); j++) {
-    V3D pt = visual_submap->add_from_voxel_map[j].point_w;
-    V2D pc(new_frame_->w2c(pt));
-
-    if (new_frame_->cam_->isInFrame(
-            pc.cast<int>(), border)) // 20px is the patch size in the matcher
-    {
-      int index = static_cast<int>(pc[1] / grid_size) * grid_n_width +
-                  static_cast<int>(pc[0] / grid_size);
-
-      if (grid_num[index] != TYPE_MAP) {
-        float cur_value = vk::shiTomasiScore(img, pc[0], pc[1]);
-        if (cur_value > scan_value[index]) {
-          scan_value[index] = cur_value;
-          append_voxel_points[index] = visual_submap->add_from_voxel_map[j];
-          grid_num[index] = TYPE_POINTCLOUD;
-        }
-      }
-    }
+    processVisualPoint(visual_submap->add_from_voxel_map[j].point_w,
+                       visual_submap->add_from_voxel_map[j], pyramid_images);
   }
 
   // double t_b1 = omp_get_wtime() - t0;
@@ -1969,7 +2082,8 @@ void VIOManager::processFrame(
 
   double t3 = omp_get_wtime();
 
-  generateVisualMapPoints(img, pg);
+  generateVisualMapPoints(img_rgb, pg);
+  // generateVisualMapPoints(img, pg);
 
   double t4 = omp_get_wtime();
 

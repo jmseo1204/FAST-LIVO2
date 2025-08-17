@@ -36,6 +36,10 @@ LIVMapper::LIVMapper(ros::NodeHandle &nh)
   pcl_wait_save_intensity.reset(new PointCloudXYZI());
   voxelmap_manager.reset(new VoxelMapManager(voxel_config, voxel_map));
   vio_manager.reset(new VIOManager());
+
+  // VIO 파라미터 읽기
+  vio_manager->readParameters(nh);
+
   root_dir = ROOT_DIR;
   initializeFiles();
   initializeComponents();
@@ -394,6 +398,10 @@ void LIVMapper::handleVIO() {
     cv::Mat &current_img = m.imgs[i];
     int cam_idx = m.img_camera_indices[i];
 
+    // [ ONLY SIDE CAMERA ]
+    // if (cam_idx == 0 || cam_idx == 2)
+    //   continue;
+
     std::cout << "[ VIO ] Processing for camera index: " << cam_idx
               << std::endl;
 
@@ -402,6 +410,7 @@ void LIVMapper::handleVIO() {
     } else {
       vio_manager->setCameraByIndex(cam_idx);
     }
+
     vio_manager->processFrame(
         current_img, _pv_prev, voxelmap_manager->voxel_map_,
         LidarMeasures.last_lio_update_time - _first_lidar_time);

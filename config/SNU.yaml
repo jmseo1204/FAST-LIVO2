@@ -65,6 +65,10 @@ vio: #일단 대충
   inverse_composition_en: false
   exposure_estimate_en: true
   inv_expo_cov: 0.1
+  
+  shiTomasiScore_threshold: 120.0
+  min_depth_threshold: 1.5
+  max_depth_threshold: 10.0
 
 imu: #일단 ig_lio/config/ncd.yaml 에서 가져옴
 
