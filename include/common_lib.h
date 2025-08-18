@@ -51,7 +51,7 @@ struct MeasureGroup {
   double vio_time;
   double lio_time;
   deque<sensor_msgs::Imu::ConstPtr> imu;
-  cv::Mat img;
+  //cv::Mat img;
   std::vector<cv::Mat> imgs;
   std::vector<int> img_camera_indices;
   MeasureGroup() {

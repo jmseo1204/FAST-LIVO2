@@ -151,8 +151,8 @@ public:
   deque<PointCloudXYZI::Ptr> lid_raw_data_buffer;
   deque<double> lid_header_time_buffer;
   deque<sensor_msgs::Imu::ConstPtr> imu_buffer;
-  deque<cv::Mat> img_buffer;
-  deque<double> img_time_buffer;
+  //deque<cv::Mat> img_buffer;
+  //deque<double> img_time_buffer;
 
   // Multi-camera support
   std::vector<std::deque<cv::Mat>> m_img_buffers;

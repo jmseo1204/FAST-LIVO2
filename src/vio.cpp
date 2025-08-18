@@ -2076,3 +2076,166 @@ void VIOManager::processFrame(
   // cv::imwrite("/home/chunran/Desktop/raycasting/" +
   // std::to_string(new_frame_->id_) + ".png", img_cp);
 }
+
+void VIOManager::startVIOUpdate(cv::Mat &initial_img, const StatesGroup& current_state) {
+    if (initial_img.channels() == 3)
+        cv::cvtColor(initial_img, initial_img, CV_BGR2GRAY);
+
+    new_frame_.reset(new Frame(cam, initial_img));
+    updateFrameState(current_state);
+    resetGrid();
+
+    // 누적 변수 초기화
+    m_H_T_H.setZero();
+    m_H_T_z.setZero();
+    m_total_features = 0;
+}
+
+// --- ADDITION: New Function 2 - Processes a single camera and accumulates its information ---
+void VIOManager::addVIOObservationsForCamera(cv::Mat &img, int cam_idx, vector<pointWithVar> &pg,
+                                             const unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &feat_map) {
+    // This function is called in a loop for each available camera image.
+
+    // 1. Set the correct camera parameters (intrinsics/extrinsics) for this specific camera
+    setCameraByIndex(cam_idx);
+    
+    // Prepare image copies for processing and visualization
+    if (img.channels() == 3) {
+        img_rgb = img.clone();
+        img_cp = img.clone();
+        cv::cvtColor(img, img, CV_BGR2GRAY);
+    } else {
+        img_rgb = img; 
+        img_cp = img;
+    }
+
+    // 2. Find which features from our map are visible in this camera's view
+    retrieveFromVisualSparseMap(img, pg, feat_map);
+    
+    if (total_points == 0) return; // No features from the map are visible in this camera
+
+    // 3. Prepare local matrices for this camera's observations
+    const int H_DIM = total_points * patch_size_total;
+    VectorXd z(H_DIM);
+    MatrixXd H_sub(H_DIM, 7); // 7 = 6 DoF pose error + 1 exposure error
+    z.setZero();
+    H_sub.setZero();
+    
+    // 4. *** CORE LOGIC: Build H_sub and z for this camera ***
+    // This loop is the computational core, moved from the old `updateState` function.
+    M3D Rwi(state->rot_end);
+    V3D Pwi(state->pos_end);
+    Rcw = Rci * Rwi.transpose();
+    Pcw = -Rci * Rwi.transpose() * Pwi + Pci;
+    Jdp_dt = Rci * Rwi.transpose();
+
+    #ifdef MP_EN
+        omp_set_num_threads(MP_PROC_NUM);
+        #pragma omp parallel for
+    #endif
+    for (int i = 0; i < total_points; i++) {
+        MD(1, 2) Jimg;
+        MD(2, 3) Jdpi;
+        MD(1, 3) Jdphi, Jdp, JdR, Jdt;
+
+        int search_level = visual_submap->search_levels[i];
+        int pyramid_level = 0; // For simplicity, we can fix the pyramid level or adapt it.
+        int scale = (1 << pyramid_level);
+        float inv_scale = 1.0f / scale;
+
+        VisualPoint *pt = visual_submap->voxel_points[i];
+        if (pt == nullptr) continue;
+
+        V3D pf = Rcw * pt->pos_ + Pcw;
+        V2D pc = cam->world2cam(pf);
+
+        computeProjectionJacobian(pf, Jdpi);
+        M3D p_hat;
+        p_hat << SKEW_SYM_MATRX(pf);
+
+        float u_ref = pc[0];
+        float v_ref = pc[1];
+        int u_ref_i = floorf(pc[0] / scale) * scale;
+        int v_ref_i = floorf(pc[1] / scale) * scale;
+        float subpix_u_ref = (u_ref - u_ref_i) / scale;
+        float subpix_v_ref = (v_ref - v_ref_i) / scale;
+        float w_ref_tl = (1.0 - subpix_u_ref) * (1.0 - subpix_v_ref);
+        float w_ref_tr = subpix_u_ref * (1.0 - subpix_v_ref);
+        float w_ref_bl = (1.0 - subpix_u_ref) * subpix_v_ref;
+        float w_ref_br = subpix_u_ref * subpix_v_ref;
+
+        vector<float> P = visual_submap->warp_patch[i];
+        double inv_ref_expo = visual_submap->inv_expo_list[i];
+
+        for (int x = 0; x < patch_size; x++) {
+            uint8_t *img_ptr = (uint8_t *)img.data + (v_ref_i + x * scale - patch_size_half * scale) * width + u_ref_i - patch_size_half * scale;
+            for (int y = 0; y < patch_size; ++y, img_ptr += scale) {
+                float du = 0.5f * ((w_ref_tl * img_ptr[scale] + w_ref_tr * img_ptr[scale*2] + w_ref_bl * img_ptr[scale*width+scale] + w_ref_br * img_ptr[scale*width+scale*2]) -
+                                  (w_ref_tl * img_ptr[-scale] + w_ref_tr * img_ptr[0] + w_ref_bl * img_ptr[scale*width-scale] + w_ref_br * img_ptr[scale*width]));
+                float dv = 0.5f * ((w_ref_tl * img_ptr[scale*width] + w_ref_tr * img_ptr[scale+scale*width] + w_ref_bl * img_ptr[width*scale*2] + w_ref_br * img_ptr[width*scale*2+scale]) -
+                                  (w_ref_tl * img_ptr[-scale*width] + w_ref_tr * img_ptr[-scale*width+scale] + w_ref_bl * img_ptr[0] + w_ref_br * img_ptr[scale]));
+                
+                Jimg << du, dv;
+                Jimg = Jimg * state->inv_expo_time * inv_scale;
+                
+                Jdphi = Jimg * Jdpi * p_hat;
+                Jdp = -Jimg * Jdpi;
+                JdR = Jdphi * Jdphi_dR + Jdp * Jdp_dR;
+                Jdt = Jdp * Jdp_dt;
+
+                double cur_value = w_ref_tl * img_ptr[0] + w_ref_tr * img_ptr[scale] + w_ref_bl * img_ptr[scale*width] + w_ref_br * img_ptr[scale*width+scale];
+                double res = state->inv_expo_time * cur_value - inv_ref_expo * P[patch_size_total * 0 + x * patch_size + y]; // Using level 0 patch
+
+                int current_pixel_idx = i * patch_size_total + x * patch_size + y;
+                z(current_pixel_idx) = res;
+
+                if (exposure_estimate_en) {
+                    H_sub.block<1, 7>(current_pixel_idx, 0) << JdR, Jdt, cur_value;
+                } else {
+                    H_sub.block<1, 6>(current_pixel_idx, 0) << JdR, Jdt;
+                }
+            }
+        }
+    }
+
+    // 5. --- Accumulation Step (The "Concatenation") ---
+    // This is where we add this camera's information to the total.
+    MatrixXd R_inv_diag = MatrixXd::Identity(H_DIM, H_DIM) / img_point_cov;
+    m_H_T_H.block<7,7>(0,0) += H_sub.transpose() * R_inv_diag * H_sub;
+    m_H_T_z.block<7,1>(0,0) += H_sub.transpose() * R_inv_diag * z;
+    m_total_features += total_points;
+
+    // 6. Perform other per-camera tasks like visualization and map management
+    generateVisualMapPoints(img, pg);
+    plotTrackedPoints();
+    updateVisualMapPoints(img);
+    updateReferencePatch(feat_map);
+}
+
+// --- ADDITION: New Function 3 - Solves the joint EKF update ---
+void VIOManager::solveVIOUpdate() {
+    if (m_total_features == 0) {
+        printf("[ VIO ] No valid features found across all cameras. Skipping update.\n");
+        return;
+    }
+
+    // This is the EKF math, but now it uses the accumulated m_H_T_H and m_H_T_z,
+    // which contain information from ALL processed cameras.
+    G.setZero();
+    MD(DIM_STATE, DIM_STATE) K_1 = (m_H_T_H + (state->cov / img_point_cov).inverse()).inverse();
+    
+    auto vec = (*state_propagat) - (*state);
+    
+    G.block<DIM_STATE, 7>(0, 0) = K_1.block<DIM_STATE, 7>(0, 0) * m_H_T_H.block<7, 7>(0, 0);
+    
+    MD(DIM_STATE, 1) solution = -K_1.block<DIM_STATE, 7>(0, 0) * m_H_T_z.block<7,1>(0,0) + vec -
+                                G.block<DIM_STATE, 7>(0, 0) * vec.block<7, 1>(0, 0);
+
+    (*state) += solution;
+    
+    state->cov = (I_STATE - G) * state->cov;
+    updateFrameState(*state);
+    
+    printf("[ VIO ] Solved joint EKF update with %d total features.\n", m_total_features);
+}
+

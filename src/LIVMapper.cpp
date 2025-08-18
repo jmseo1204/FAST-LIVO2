@@ -390,6 +390,18 @@ void LIVMapper::handleVIO() {
 
     publish_img_rgb(pubImages[cam_idx], vio_manager);
 
+    vio_manager->startVIOUpdate(m.imgs[0], _state);
+    for (size_t i = 0; i < m.imgs.size(); ++i) {
+    cv::Mat &current_img = m.imgs[i];
+    int cam_idx = m.img_camera_indices[i];
+    
+    vio_manager->addVIOObservationsForCamera(current_img, cam_idx, _pv_list, voxelmap_manager->voxel_map_);
+    
+    publish_img_rgb(pubImages[cam_idx], vio_manager);
+  }
+
+    vio_manager -> solveVIOUpdate();
+
     publish_frame_world(pubLaserCloudFullRes, vio_manager);
   }
 
@@ -1000,11 +1012,11 @@ void LIVMapper::img_cbk(const sensor_msgs::ImageConstPtr &msg_in, int cam_idx) {
 
   cv::Mat img_cur = getImageFromMsg(msg);
   m_img_buffers[cam_idx].push_back(img_cur);
-  m_img_time_buffers[cam_idx].push_back(img_time_correct);
+  m_img_time_buffers[cam_idx].push_back(msg_header_time);
 
   // ROS_INFO("Correct Image time: %.6f", img_time_correct);
 
-  last_timestamp_imgs[cam_idx] = img_time_correct;
+  last_timestamp_imgs[cam_idx] = msg_header_time;
   // cv::imshow("img", img);
   // cv::waitKey(1);
   // cout<<"last_timestamp_img:::"<<last_timestamp_img<<endl;
@@ -1263,266 +1275,105 @@ void LIVMapper::img_cbk(const sensor_msgs::ImageConstPtr &msg_in, int cam_idx) {
 // }
 
 bool LIVMapper::sync_packages(LidarMeasureGroup &meas) {
-  // std::cout << std::fixed << std::setprecision(9)
-  //           << "[DEBUG] sync_packages called! timestamp: "
-  //           << meas.last_lio_update_time << std::endl;
-
-  if (lid_raw_data_buffer.empty() || imu_buffer.empty()) {
-    return false;
-  }
-
-  double min_time_start = std::numeric_limits<double>::max();
-  for (int i = 0; i < m_img_buffers.size(); i++) {
-    while (!m_img_time_buffers[i].empty() &&
-           m_img_time_buffers[i].front() <
-               meas.last_lio_update_time + 0.00001) {
-      m_img_time_buffers[i].pop_front();
-      m_img_buffers[i].pop_front();
+    if (lid_raw_data_buffer.empty() || imu_buffer.empty()) {
+        return false;
     }
 
-    if (!m_img_time_buffers[i].empty()) {
-      min_time_start = min_time_start > m_img_time_buffers[i].front()
-                           ? m_img_time_buffers[i].front()
-                           : min_time_start;
-      // min_time_start = m_img_time_buffers[0].front();
-    } else {
-      return false;
-    }
-  }
-
-  EKF_STATE last_lio_vio_flg = meas.lio_vio_flg;
-  switch (last_lio_vio_flg) {
-  case WAIT:
-  case VIO: {
-
-    double time_window = time_window_;
-
-    if (meas.last_lio_update_time <= 0.0)
-      meas.last_lio_update_time = lid_header_time_buffer.front();
-
-    double end_time = min_time_start + time_window;
-
-    std::map<int, std::pair<double, cv::Mat>> candidates;
-
-    double key_frame_time;
-    vector<double> key_frame_times;
-
-    // [DEBUG]
-    const char block = '#';
-    const double time_unit = 0.01; // 0.01초 = 공백 1칸
-
-    // 1. 각 buffer의 front() 가져오기
-    vector<double> fronts;
-    for (const auto &buf : m_img_time_buffers) {
-      if (!buf.empty()) {
-        fronts.push_back(buf.front());
-      } else {
-        fronts.push_back(numeric_limits<double>::max());
-      }
-    }
-
-    // 2. 최소 timestamp 구하기
-    double min_time = *min_element(fronts.begin(), fronts.end());
-
-    // 3. 시각화 출력
-    for (size_t i = 0; i < m_img_time_buffers.size(); ++i) {
-      size_t size = m_img_time_buffers[i].size();
-      if (size == 0) {
-        cout << "Buffer " << i << ": (empty)" << endl;
-        continue;
-      }
-
-      double offset = fronts[i] - min_time;
-      int spaces = static_cast<int>(round(offset / time_unit));
-
-      cout << "Buffer " << i << ": ";
-      cout << string(spaces, ' ');
-      cout << string(size, block);
-      cout << " (" << size << ", offset: " << fixed << setprecision(6) << offset
-           << "s)" << endl;
-    }
-
-    int min_idx = -1;
+    double min_time_start = std::numeric_limits<double>::max();
+    bool any_image_available = false;
     for (int i = 0; i < num_of_cam; i++) {
-      // DEBUG
-      // if (i > 0)
-      //   continue;
-
-      if (m_img_time_buffers[i].empty()) {
-        std::cout << "channel pass(empty): " << i << std::endl;
-      }
-      // std::cout << "[DEBUG] channel: " << i << " "
-      //           << m_img_time_buffers[i].front() << std::endl;
-
-      double current_img_time = m_img_time_buffers[i].front();
-
-      if (current_img_time >= end_time) {
-        std::cout << std::fixed << std::setprecision(4)
-                  << "channel pass(over): " << i << " - " << current_img_time
-                  << std::endl;
-        continue;
-      }
-
-      double capture_time = current_img_time + exposure_time_init;
-      cv::Mat image = m_img_buffers[i].front();
-      candidates[i] = {capture_time, image};
-      key_frame_times.push_back(capture_time);
-      min_idx = min_idx == -1
-                    ? i
-                    : (m_img_time_buffers[min_idx].front() > current_img_time
-                           ? i
-                           : min_idx);
+        while (!m_img_time_buffers[i].empty() && m_img_time_buffers[i].front() < meas.last_lio_update_time + 1e-5) {
+            m_img_time_buffers[i].pop_front();
+            m_img_buffers[i].pop_front();
+        }
+        if (!m_img_time_buffers[i].empty()) {
+            any_image_available = true;
+            min_time_start = std::min(min_time_start, m_img_time_buffers[i].front());
+        }
     }
 
-    if (candidates.empty()) {
-      // std::cout << "No Candidates" << std::endl;
-      return false;
-    } else if (candidates.size() <= 0) {
-      m_img_time_buffers[min_idx].pop_front();
-      m_img_buffers[min_idx].pop_front();
-      return false;
+    if (!any_image_available) return false;
+
+    double key_frame_time = 0;
+    std::map<int, std::pair<double, cv::Mat>> candidates;
+    for (int i = 0; i < num_of_cam; i++) {
+        if (!m_img_time_buffers[i].empty() && m_img_time_buffers[i].front() < min_time_start + time_window_) {
+            double capture_time = m_img_time_buffers[i].front() + exposure_time_init;
+            candidates[i] = {capture_time, m_img_buffers[i].front()};
+            key_frame_time = std::max(key_frame_time, capture_time);
+        }
     }
 
-    key_frame_time =
-        *std::max_element(key_frame_times.begin(), key_frame_times.end());
+    if (candidates.empty()) return false;
 
-    m_candidates = candidates;
-
-    std::cout << "candidates: " << candidates.size() << std::endl;
-
-    meas.measures.clear();
-
-    double lid_newest_time =
-        lid_header_time_buffer.back() +
-        lid_raw_data_buffer.back()->points.back().curvature / 1000.0;
+    double lid_newest_time = lid_header_time_buffer.back() + lid_raw_data_buffer.back()->points.back().curvature / 1000.0;
     double imu_newest_time = imu_buffer.back()->header.stamp.toSec();
 
-    if (key_frame_time > lid_newest_time) {
-      std::cout << std::fixed << std::setprecision(6)
-                << "[sync false] lid < key_frame: " << lid_newest_time << " < "
-                << key_frame_time << std::endl;
-      return false;
+    if (key_frame_time > lid_newest_time || key_frame_time > imu_newest_time) {
+        return false;
     }
 
-    if (key_frame_time > imu_newest_time) {
-      std::cout << std::fixed << std::setprecision(6)
-                << "[sync false] IMU < key_frame: " << imu_newest_time << " < "
-                << key_frame_time << std::endl;
-      return false;
+    for (const auto& pair : candidates) {
+        m_img_time_buffers[pair.first].pop_front();
+        m_img_buffers[pair.first].pop_front();
     }
 
-    for (int i = 0; i < num_of_cam; i++) {
-      if (candidates.count(i)) {
-        m_img_time_buffers[i].pop_front();
-        m_img_buffers[i].pop_front();
-      }
-    }
-
-    if ((meas.pcl_proc_next->size() == 0 &&
-         key_frame_time < lid_header_time_buffer.front())) {
-      std::cout << "No pcl pending" << std::endl;
-      return false;
-    }
-
+    meas.measures.clear();
     struct MeasureGroup m;
-
-    m.imu.clear();
     m.lio_time = key_frame_time;
     m.vio_time = key_frame_time;
-    mtx_buffer.lock();
 
-    while (!imu_buffer.empty() && imu_buffer.front()->header.stamp.toSec() <
-                                      meas.last_lio_update_time) {
-      imu_buffer.pop_front(); // 오래된 IMU 데이터 제거
+    for (const auto& pair : candidates) {
+        m.img_camera_indices.push_back(pair.first);
+        m.imgs.push_back(pair.second.second);
     }
-    while (!imu_buffer.empty() &&
-           imu_buffer.front()->header.stamp.toSec() <= key_frame_time) {
-      m.imu.push_back(imu_buffer.front());
-      imu_buffer.pop_front();
+    
+    mtx_buffer.lock();
+    while (!imu_buffer.empty() && imu_buffer.front()->header.stamp.toSec() < meas.last_lio_update_time) {
+        imu_buffer.pop_front();
+    }
+    while (!imu_buffer.empty() && imu_buffer.front()->header.stamp.toSec() <= key_frame_time) {
+        m.imu.push_back(imu_buffer.front());
+        imu_buffer.pop_front();
     }
     mtx_buffer.unlock();
-    sig_buffer.notify_all();
 
     *(meas.pcl_proc_cur) = *(meas.pcl_proc_next);
-    PointCloudXYZI().swap(*meas.pcl_proc_next); // pcl_proc_next는 비움
-
-    int lid_frame_num = lid_raw_data_buffer.size();
-    int max_size = meas.pcl_proc_cur->size() + 24000 * lid_frame_num;
-    meas.pcl_proc_cur->reserve(max_size);
-    meas.pcl_proc_next->reserve(max_size);
-
-    // while (meas.pcl_proc_cur->points.front().curvature ){
-    //   meas.pcl_proc_cur->points.pop_front()
-    // }
+    PointCloudXYZI().swap(*meas.pcl_proc_next);
 
     while (!lid_raw_data_buffer.empty()) {
-      if (lid_header_time_buffer.front() > key_frame_time)
-        break;
-      auto pcl(lid_raw_data_buffer.front()->points);
-      double frame_header_time(lid_header_time_buffer.front());
-      float max_offs_time_ms = (m.lio_time - frame_header_time) * 1000.0f;
+        if (lid_header_time_buffer.front() > key_frame_time) break;
+        
+        auto& pcl_points = lid_raw_data_buffer.front()->points;
+        double frame_header_time = lid_header_time_buffer.front();
+        float max_offs_time_ms = (key_frame_time - frame_header_time) * 1000.0f;
 
-      for (int i = 0; i < pcl.size(); i++) {
-        auto pt = pcl[i];
-        if (pcl[i].curvature < max_offs_time_ms) {
-          pt.curvature +=
-              (frame_header_time - meas.last_lio_update_time) * 1000.0f;
-          meas.pcl_proc_cur->points.push_back(pt);
-        } else {
-          pt.curvature += (frame_header_time - m.lio_time) * 1000.0f;
-          meas.pcl_proc_next->points.push_back(pt);
+        for (const auto& pt : pcl_points) {
+            PointType new_pt = pt;
+            if (pt.curvature < max_offs_time_ms) {
+                new_pt.curvature += (frame_header_time - meas.last_lio_update_time) * 1000.0f;
+                meas.pcl_proc_cur->points.push_back(new_pt);
+            } else {
+                new_pt.curvature += (frame_header_time - key_frame_time) * 1000.0f;
+                meas.pcl_proc_next->points.push_back(new_pt);
+            }
         }
-      }
-      lid_raw_data_buffer.pop_front();
-      lid_header_time_buffer.pop_front();
+        lid_raw_data_buffer.pop_front();
+        lid_header_time_buffer.pop_front();
     }
-
+    
     meas.measures.push_back(m);
-    meas.lio_vio_flg = LIO;
 
-    return true;
-  }
-  case LIO: {
-
-    meas.lio_vio_flg = VIO;
-    // printf("[ Data Cut ] VIO \n");
-    meas.measures.clear();
-    double imu_time = imu_buffer.front()->header.stamp.toSec();
-
-    struct MeasureGroup m;
-    // m.lio_time = meas.last_lio_update_time;
-    m.vio_time = meas.last_lio_update_time;
-    m.vio_time = meas.last_lio_update_time;
-
-    // std::cout << "candid num: " << m_candidates.size() << std::endl;
-
-    for (auto const &[cam_idx, val] : m_candidates) {
-      m.imgs.push_back(val.second); // cv::Mat
-      m.img_camera_indices.push_back(cam_idx);
+    if (meas.lio_vio_flg == VIO || meas.lio_vio_flg == WAIT) {
+        meas.lio_vio_flg = LIO;
+    } else {
+        meas.lio_vio_flg = VIO;
     }
-
-    // m.img = img_buffer.front();
-    mtx_buffer.lock();
-    // while ((!imu_buffer.empty() && (imu_time < img_capture_time)))
-    // {
-    //   imu_time = imu_buffer.front()->header.stamp.toSec();
-    //   if (imu_time > img_capture_time) break;
-    //   m.imu.push_back(imu_buffer.front());
-    //   imu_buffer.pop_front();
-    //   printf("[ Data Cut ] imu time: %lf \n",
-    //   imu_buffer.front()->header.stamp.toSec());
-    // }
-    mtx_buffer.unlock();
-    sig_buffer.notify_all();
-    meas.measures.push_back(m);
-    lidar_pushed = false;
-    // after VIO update, the _lidar_frame_end_time will be refresh.
-    // printf("[ Data Cut ] VIO process time: %lf \n", omp_get_wtime() - t0);
+    
     return true;
-  }
-  }
-  return true;
 }
+
+
 
 void LIVMapper::publish_img_rgb(const image_transport::Publisher &pubImage,
                                 VIOManagerPtr vio_manager) {

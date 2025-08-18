@@ -84,10 +84,18 @@ public:
   std::vector<V3D> m_P_c_i_vec;
   std::vector<M3D> m_R_c_l_vec;
   std::vector<V3D> m_P_c_l_vec;
+  Matrix<double, DIM_STATE, DIM_STATE> m_H_T_H;
+  Matrix<double, DIM_STATE, 1> m_H_T_z;
+  int m_total_features;
   M3D Rli, Rci, Rcl, Rcw, Jdphi_dR, Jdp_dt, Jdp_dR;
   V3D Pli, Pci, Pcl, Pcw;
   int cam_idx;
   vector<unordered_map<VOXEL_LOCATION, int> *> sub_feat_maps;
+
+  void startVIOUpdate(cv::Mat &initial_img, const StatesGroup& current_state);
+  void addVIOObservationsForCamera(cv::Mat &img, int cam_idx, vector<pointWithVar> &pg,
+                                   const unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &feat_map);
+  void solveVIOUpdate();
 
   void setCameraByIndex(int index);
   void setLidarToCameraExtrinsic(vector<double> &R, vector<double> &P);
