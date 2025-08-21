@@ -12,10 +12,10 @@ common:
   img_en: 1
   lidar_en: 1
   ros_driver_bug_fix: false
-  sync_time_window: 0.09
-  minimum_simultaneous_frame_num: 2
+  sync_time_window: 0.03
+  minimum_simultaneous_frame_num: 1
   lidar_window_size: 0.1
-  en_cam_backprop: true
+  en_cam_backprop: 1
 
 extrin_calib:
   # il (lidar -> IMU)
@@ -42,7 +42,7 @@ extrin_calib:
             0.00819508661,  0.99996466784, -0.00187179583]
   P_cl_3: [-0.01203026275, 0.10700825263, -0.13422271475]
 time_offset: #일단 대충
-  lidar_time_offset: -0.1
+  lidar_time_offset: 0.0
   imu_time_offset: 0.0
   img_time_offset: 0.0
   exposure_time_init: 0.0
@@ -66,9 +66,9 @@ vio: #일단 대충
   exposure_estimate_en: true
   inv_expo_cov: 0.1
   
-  shiTomasiScore_threshold: 120.0
-  min_depth_threshold: 1.5
-  max_depth_threshold: 10.0
+  shiTomasiScore_threshold: 30.0
+  min_depth_threshold: 0.0
+  max_depth_threshold: 100.0
 
 imu: #일단 ig_lio/config/ncd.yaml 에서 가져옴
 

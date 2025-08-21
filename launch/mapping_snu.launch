@@ -6,7 +6,10 @@
 	<rosparam command="load" file="$(find fast_livo)/config/SNU.yaml" />
 
 	<node pkg="fast_livo" type="fastlivo_mapping" name="laserMapping" output="screen">
-		<rosparam file="$(find fast_livo)/config/camera_SNU.yaml" />
+		<rosparam file="$(find fast_livo)/config/camera_SNU_1.yaml" />
+		<rosparam file="$(find fast_livo)/config/camera_SNU_2.yaml" />
+		<rosparam file="$(find fast_livo)/config/camera_SNU_3.yaml" />
+		<rosparam file="$(find fast_livo)/config/camera_SNU_4.yaml" />
 	</node>
 	
 	<group if="$(arg rviz)">

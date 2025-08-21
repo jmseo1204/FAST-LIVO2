@@ -63,10 +63,10 @@ public:
   // void img_cbk(const sensor_msgs::ImageConstPtr &msg_in);
   void img_cbk(const sensor_msgs::ImageConstPtr &msg_in, int cam_idx);
   void publish_img_rgb(const image_transport::Publisher &pubImage,
-                       VIOManagerPtr vio_manager);
+                       VIOManagerPtr vio_manager, int cam_idx);
   void publish_frame_world(bool publish_frame,
                            const ros::Publisher &pubLaserCloudFullRes,
-                           VIOManagerPtr vio_manager);
+                           VIOManagerPtr vio_manager, int cam_idx);
   void publish_visual_sub_map(const ros::Publisher &pubSubVisualMap);
   void publish_effect_world(const ros::Publisher &pubLaserCloudEffect,
                             const std::vector<PointToPlane> &ptpl_list);
@@ -75,7 +75,7 @@ public:
   void publish_mavros(const ros::Publisher &mavros_pose_publisher);
   void publish_path(const ros::Publisher pubPath);
   void readParameters(ros::NodeHandle &nh);
-  void save_path_to_file();
+  void save_path_to_file(const std::string &file_path);
   template <typename T> void set_posestamp(T &out);
   template <typename T>
   void pointBodyToWorld(const Eigen::Matrix<T, 3, 1> &pi,

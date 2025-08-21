@@ -148,7 +148,14 @@ void VIOManager::setExtrinsicParameters(const M3D &rot, const V3D &transl,
 }
 
 void VIOManager::initializeVIO() {
-  visual_submap = new SubSparseMap;
+  visual_submaps.resize(m_cameras.size());
+  for (int i = 0; i < m_cameras.size(); i++)
+    visual_submaps[i] = new SubSparseMap;
+
+  new_frame_vec.resize(m_cameras.size());
+  for (int i = 0; i < m_cameras.size(); i++) {
+    new_frame_vec[i] = nullptr;
+  }
 
   setCameraByIndex(0);
 
@@ -448,9 +455,248 @@ double VIOManager::calculateNCC(float *ref_patch, float *cur_patch,
   return numerator / sqrt(demoniator1 * demoniator2 + 1e-10);
 }
 
+void VIOManager::buildJacobianAndResiduals(const cv::Mat &img,
+                                           SubSparseMap *current_cam_submap,
+                                           int level, VectorXd &z_cam,
+                                           MatrixXd &H_sub_cam) {
+
+  // std::cout << "buildJacobianAndResiduals" << std::endl;
+
+  int num_points = current_cam_submap->voxel_points.size();
+  if (num_points == 0) {
+    z_cam.resize(0);
+    H_sub_cam.resize(0, 7);
+    return;
+  }
+
+  const int H_DIM = num_points * patch_size_total;
+  z_cam.resize(H_DIM);
+  H_sub_cam.resize(H_DIM, 7);
+
+  // 현재 카메라 파라미터(Rci, Pci, Jdphi_dR 등)는 이 함수가 호출되기 전에
+  // 외부에서 이미 설정되었다고 가정합니다.
+  M3D Rwi(state->rot_end);
+  V3D Pwi(state->pos_end);
+  Rcw = Rci * Rwi.transpose();
+  Pcw = -Rci * Rwi.transpose() * Pwi + Pci;
+  Jdp_dt = Rci * Rwi.transpose();
+
+#pragma omp parallel for
+  for (int i = 0; i < num_points; i++) {
+    MD(1, 2) Jimg;
+    MD(2, 3) Jdpi;
+    MD(1, 3) Jdphi, Jdp, JdR, Jdt;
+
+    VisualPoint *pt = current_cam_submap->voxel_points[i];
+
+    V3D pf = Rcw * pt->pos_ + Pcw;
+    V2D pc = cam->world2cam(pf);
+
+    computeProjectionJacobian(pf, Jdpi);
+    M3D p_hat;
+    p_hat << SKEW_SYM_MATRX(pf);
+
+    int search_level = current_cam_submap->search_levels[i];
+    int pyramid_level = level + search_level;
+    int scale = (1 << pyramid_level);
+    float inv_scale = 1.0f / scale;
+
+    float u_ref = pc[0];
+    float v_ref = pc[1];
+    int u_ref_i = floorf(pc[0] / scale) * scale;
+    int v_ref_i = floorf(pc[1] / scale) * scale;
+    float subpix_u_ref = (u_ref - u_ref_i) / scale;
+    float subpix_v_ref = (v_ref - v_ref_i) / scale;
+    float w_ref_tl = (1.0 - subpix_u_ref) * (1.0 - subpix_v_ref);
+    float w_ref_tr = subpix_u_ref * (1.0 - subpix_v_ref);
+    float w_ref_bl = (1.0 - subpix_u_ref) * subpix_v_ref;
+    float w_ref_br = subpix_u_ref * subpix_v_ref;
+
+    const std::vector<float> &P = current_cam_submap->warp_patch[i];
+    double inv_ref_expo = current_cam_submap->inv_expo_list[i];
+
+    for (int x = 0; x < patch_size; x++) {
+      uint8_t *img_ptr =
+          (uint8_t *)img.data +
+          (v_ref_i + x * scale - patch_size_half * scale) * width + u_ref_i -
+          patch_size_half * scale;
+      for (int y = 0; y < patch_size; ++y, img_ptr += scale) {
+        float du =
+            0.5f * ((w_ref_tl * img_ptr[scale] + w_ref_tr * img_ptr[scale * 2] +
+                     w_ref_bl * img_ptr[scale * width + scale] +
+                     w_ref_br * img_ptr[scale * width + scale * 2]) -
+                    (w_ref_tl * img_ptr[-scale] + w_ref_tr * img_ptr[0] +
+                     w_ref_bl * img_ptr[scale * width - scale] +
+                     w_ref_br * img_ptr[scale * width]));
+        float dv = 0.5f * ((w_ref_tl * img_ptr[scale * width] +
+                            w_ref_tr * img_ptr[scale + scale * width] +
+                            w_ref_bl * img_ptr[width * scale * 2] +
+                            w_ref_br * img_ptr[width * scale * 2 + scale]) -
+                           (w_ref_tl * img_ptr[-scale * width] +
+                            w_ref_tr * img_ptr[-scale * width + scale] +
+                            w_ref_bl * img_ptr[0] + w_ref_br * img_ptr[scale]));
+
+        Jimg << du, dv;
+        Jimg = Jimg * state->inv_expo_time * inv_scale;
+
+        Jdphi = Jimg * Jdpi * p_hat;
+        Jdp = -Jimg * Jdpi;
+        JdR = Jdphi * Jdphi_dR + Jdp * Jdp_dR;
+        Jdt = Jdp * Jdp_dt;
+
+        double cur_value = w_ref_tl * img_ptr[0] + w_ref_tr * img_ptr[scale] +
+                           w_ref_bl * img_ptr[scale * width] +
+                           w_ref_br * img_ptr[scale * width + scale];
+        double res =
+            state->inv_expo_time * cur_value -
+            inv_ref_expo * P[patch_size_total * level + x * patch_size + y];
+
+        int row_idx = i * patch_size_total + x * patch_size + y;
+        z_cam(row_idx) = res;
+
+        if (exposure_estimate_en) {
+          H_sub_cam.block<1, 7>(row_idx, 0) << JdR, Jdt, cur_value;
+        } else {
+          H_sub_cam.block<1, 6>(row_idx, 0) << JdR, Jdt;
+        }
+      }
+    }
+  }
+}
+
+void VIOManager::computeJacobianAndUpdateEKF(
+    const std::vector<cv::Mat> &imgs, const std::vector<int> &cam_indices,
+    const std::vector<Pose6D> &imu_poses, bool en_cam_backprop) {
+
+  // std::cout << "computeJacobianAndUpdateEKF" << std::endl;
+  compute_jacobian_time = 0.0;
+  update_ekf_time = 0.0;
+
+  // 패치 피라미드 레벨에 대한 Coarse-to-Fine 루프
+  for (int level = patch_pyrimid_level - 1; level >= 0; level--) {
+
+    StatesGroup old_state = (*state);
+    bool EKF_end = false;
+    float last_error = std::numeric_limits<float>::max();
+
+    // IEKF 반복 최적화 루프
+    for (int iteration = 0; iteration < max_iterations; iteration++) {
+      double t1_jacobian = omp_get_wtime();
+
+      std::vector<MatrixXd> H_list;
+      std::vector<VectorXd> z_list;
+      int total_rows = 0;
+
+      // 1. 각 카메라에 대해 H와 z를 현재 state 기준으로 계산하고 수집
+      for (size_t i = 0; i < imgs.size(); ++i) {
+        int cam_idx = cam_indices[i];
+        const cv::Mat &img = imgs[i];
+
+        setCameraByIndex(cam_idx);
+
+        // b) H와 z 계산
+        VectorXd z_cam;
+        MatrixXd H_sub_cam;
+        // 해당 카메라의 특징점 리스트(visual_submaps[cam_idx])를 전달
+        buildJacobianAndResiduals(img, visual_submaps[cam_idx], level, z_cam,
+                                  H_sub_cam);
+
+        if (H_sub_cam.rows() > 0) {
+          H_list.push_back(H_sub_cam);
+          z_list.push_back(z_cam);
+          total_rows += H_sub_cam.rows();
+        }
+      }
+
+      if (total_rows == 0) {
+        if (iteration == 0)
+          total_points = 0; // 첫 반복에 포인트가 없으면 0으로 설정
+        EKF_end = true;
+        break;
+      }
+      if (iteration == 0)
+        total_points = total_rows / patch_size_total;
+
+      // 2. 모든 H와 z를 하나의 큰 행렬/벡터로 결합 (Stacking)
+      MatrixXd H_all(total_rows, 7);
+      VectorXd z_all(total_rows);
+      int current_row = 0;
+      for (size_t i = 0; i < H_list.size(); ++i) {
+        H_all.block(current_row, 0, H_list[i].rows(), H_list[i].cols()) =
+            H_list[i];
+        z_all.segment(current_row, z_list[i].rows()) = z_list[i];
+        current_row += H_list[i].rows();
+      }
+
+      double t2_jacobian = omp_get_wtime();
+      compute_jacobian_time += t2_jacobian - t1_jacobian;
+
+      float error = z_all.squaredNorm() / total_rows;
+
+      if (error < last_error) {
+        old_state = (*state);
+        last_error = error;
+
+        // 3. 결합된 H, z를 사용하여 단일 최적화 수행
+        auto &&H_sub_T = H_all.transpose();
+        H_T_H.setZero();
+        G.setZero();
+        H_T_H.block<7, 7>(0, 0) = H_sub_T * H_all;
+        MD(DIM_STATE, DIM_STATE) &&K_1 =
+            (H_T_H + (state->cov / img_point_cov).inverse()).inverse();
+        auto &&HTz = H_sub_T * z_all;
+        auto vec = (*state_propagat) - (*state);
+        G.block<DIM_STATE, 7>(0, 0) =
+            K_1.block<DIM_STATE, 7>(0, 0) * H_T_H.block<7, 7>(0, 0);
+        MD(DIM_STATE, 1)
+        solution = -K_1.block<DIM_STATE, 7>(0, 0) * HTz + vec -
+                   G.block<DIM_STATE, 7>(0, 0) * vec.block<7, 1>(0, 0);
+
+        (*state) += solution;
+
+        auto &&rot_add = solution.block<3, 1>(0, 0);
+        auto &&t_add = solution.block<3, 1>(3, 0);
+        if ((rot_add.norm() * 57.3f < 0.01f) &&
+            (t_add.norm() * 100.0f < 0.015f)) {
+          EKF_end = true;
+        }
+      } else {
+        (*state) = old_state;
+        EKF_end = true;
+      }
+
+      update_ekf_time += omp_get_wtime() - t2_jacobian;
+
+      if (EKF_end)
+        break;
+    }
+  }
+
+  // 최종 공분산 업데이트 및 상태 반영
+  state->cov -= G * state->cov;
+}
+
+// void VIOManager::computeJacobianAndUpdateEKF(cv::Mat img) {
+//   if (total_points == 0)
+//     return;
+
+//   compute_jacobian_time = update_ekf_time = 0.0;
+
+//   for (int level = patch_pyrimid_level - 1; level >= 0; level--) {
+//     if (inverse_composition_en) {
+//       has_ref_patch_cache = false;
+//       updateStateInverse(img, level);
+//     } else
+//       updateState(img, level);
+//   }
+//   state->cov -= G * state->cov;
+//   updateFrameState(*state);
+// }
+
 void VIOManager::retrieveFromVisualSparseMap(
     cv::Mat img, multimap<double, pointWithVar> &pg,
-    const unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &plane_map) {
+    const unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &plane_map,
+    int cam_idx) {
   if (feat_map.size() <= 0)
     return;
   double ts0 = omp_get_wtime();
@@ -880,29 +1126,13 @@ void VIOManager::retrieveFromVisualSparseMap(
     }
   }
   total_points = visual_submap->voxel_points.size();
+  visual_submaps[cam_idx] = visual_submap;
 
   // double t3 = omp_get_wtime();
   // cout<<"C. addSubSparseMap: "<<t3-t2<<endl;
   // cout<<"depthcontinuous: C1 "<<t_2<<" C2 "<<t_3<<" C3 "<<t_4<<" C4
   // "<<t_5<<endl;
   printf("[ VIO ] Retrieve %d points from visual sparse map\n", total_points);
-}
-
-void VIOManager::computeJacobianAndUpdateEKF(cv::Mat img) {
-  if (total_points == 0)
-    return;
-
-  compute_jacobian_time = update_ekf_time = 0.0;
-
-  for (int level = patch_pyrimid_level - 1; level >= 0; level--) {
-    if (inverse_composition_en) {
-      has_ref_patch_cache = false;
-      updateStateInverse(img, level);
-    } else
-      updateState(img, level);
-  }
-  state->cov -= G * state->cov;
-  updateFrameState(*state);
 }
 
 void VIOManager::generateVisualMapPoints(cv::Mat img,
@@ -1735,6 +1965,7 @@ void VIOManager::setCameraByIndex(int index) {
   this->cy = cam->cy();
   this->image_resize_factor = cam->scale();
   this->sub_feat_map = sub_feat_maps[index];
+  this->visual_submap = visual_submaps[index];
 
   this->Rci = m_R_c_i_vec[index];
   this->Pci = m_P_c_i_vec[index];
@@ -1748,8 +1979,146 @@ void VIOManager::setCameraByIndex(int index) {
   tmp << SKEW_SYM_MATRX(Pic);
   this->Jdp_dR = -Rci * tmp;
 
-  this->cam_idx = index;
-  this->sub_feat_map = sub_feat_maps[index];
+  this->new_frame_ = new_frame_vec[index];
+  updateFrameState(*state);
+
+  // this->cam_idx = index;
+}
+
+// In vio.cpp
+
+void VIOManager::processMultiCamVIO(
+    const std::vector<cv::Mat> &imgs, const std::vector<int> &cam_indices,
+    const std::vector<Pose6D> &imu_poses, multimap<double, pointWithVar> &pg,
+    const unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &feat_map,
+    double img_time, bool en_cam_backprop) {
+  // 타이머 및 프레임 카운트 변수들
+  std::cout << "processMultiCamVIO" << std::endl;
+
+  double t1(0), t2(0), t3(0), t4(0), t5(0), t6(0), t7(0);
+  t1 = omp_get_wtime();
+
+  img_cps.clear();
+  img_rgbs.clear();
+  img_cps.resize(m_cameras.size());
+  img_rgbs.resize(m_cameras.size());
+
+  std::vector<cv::Mat> processed_imgs;
+
+  backupOriginalExtrinsics();
+
+  for (size_t i = 0; i < imgs.size(); ++i) {
+    int cam_idx = cam_indices[i];
+    cv::Mat current_img = imgs[i];
+
+    if (width != current_img.cols || height != current_img.rows) {
+      cv::resize(current_img, current_img, cv::Size(width, height), 0, 0,
+                 CV_INTER_LINEAR);
+    }
+    img_cps[cam_idx] = current_img.clone();
+    img_rgbs[cam_idx] = current_img.clone();
+
+    if (current_img.channels() == 3) {
+      cv::cvtColor(current_img, current_img, CV_BGR2GRAY);
+    }
+    delete new_frame_vec[cam_idx];
+    new_frame_vec[cam_idx] = new Frame(cam, current_img);
+
+    if (en_cam_backprop) {
+      compensateExtrinsicsByTimeOffset(imu_poses, cam_idx);
+    } else {
+      setCameraByIndex(cam_idx);
+    }
+
+    resetGrid();
+
+    // 현재 카메라로 관측되는 특징점들을 찾아 멤버 변수 visual_submap에 저장
+    retrieveFromVisualSparseMap(current_img, pg, feat_map, cam_idx);
+
+    processed_imgs.push_back(current_img);
+  }
+
+  t2 = omp_get_wtime();
+
+  // 2. 통합 최적화 수행
+  computeJacobianAndUpdateEKF(processed_imgs, cam_indices, imu_poses,
+                              en_cam_backprop);
+
+  t3 = omp_get_wtime();
+
+  for (size_t i = 0; i < processed_imgs.size(); ++i) {
+
+    int cam_idx = cam_indices[i];
+    cv::Mat &img = processed_imgs[i];
+    std::cout << "[ VIO ] Processing for camera index: " << cam_idx
+              << std::endl;
+
+    setCameraByIndex(cam_idx);
+
+    total_points = visual_submap->voxel_points.size();
+
+    // 후속 작업들
+    generateVisualMapPoints(img_rgbs[cam_idx], pg);
+    t4 = (t4 * i + omp_get_wtime()) / (i + 1);
+
+    plotTrackedPoints(cam_idx);
+
+    if (plot_flag)
+      projectPatchFromRefToCur(feat_map);
+    t5 = (t5 * i + omp_get_wtime()) / (i + 1);
+
+    updateVisualMapPoints(img);
+    t6 = (t6 * i + omp_get_wtime()) / (i + 1);
+
+    updateReferencePatch(feat_map);
+    t7 = (t7 * i + omp_get_wtime()) / (i + 1);
+
+    if (colmap_output_en)
+      dumpDataForColmap();
+  }
+
+  restoreOriginalExtrinsics();
+
+  frame_count++;
+  ave_total = ave_total * (frame_count - 1) / frame_count +
+              (t7 - t1 - (t5 - t4)) / frame_count;
+
+  printf("\033[1;34m+----------------------------------------------------------"
+         "---+\033[0m\n");
+  printf("\033[1;34m|                         VIO Time                         "
+         "   |\033[0m\n");
+  printf("\033[1;34m+----------------------------------------------------------"
+         "---+\033[0m\n");
+  printf("\033[1;34m| %-29s | %-27zu |\033[0m\n", "Sparse Map Size",
+         feat_map.size());
+  printf("\033[1;34m+----------------------------------------------------------"
+         "---+\033[0m\n");
+  printf("\033[1;34m| %-29s | %-27s |\033[0m\n", "Algorithm Stage",
+         "Time (secs)");
+  printf("\033[1;34m+----------------------------------------------------------"
+         "---+\033[0m\n");
+  printf("\033[1;32m| %-29s | %-27lf |\033[0m\n", "retrieveFromVisualSparseMap",
+         t2 - t1);
+  printf("\033[1;32m| %-29s | %-27lf |\033[0m\n", "computeJacobianAndUpdateEKF",
+         t3 - t2);
+  printf("\033[1;32m| %-27s   | %-27lf |\033[0m\n", "-> computeJacobian",
+         compute_jacobian_time);
+  printf("\033[1;32m| %-27s   | %-27lf |\033[0m\n", "-> updateEKF",
+         update_ekf_time);
+  printf("\033[1;32m| %-29s | %-27lf |\033[0m\n", "generateVisualMapPoints",
+         t4 - t3);
+  printf("\033[1;32m| %-29s | %-27lf |\033[0m\n", "updateVisualMapPoints",
+         t6 - t5);
+  printf("\033[1;32m| %-29s | %-27lf |\033[0m\n", "updateReferencePatch",
+         t7 - t6);
+  printf("\033[1;34m+----------------------------------------------------------"
+         "---+\033[0m\n");
+  printf("\033[1;32m| %-29s | %-27lf |\033[0m\n", "Current Total Time",
+         t7 - t1 - (t5 - t4));
+  printf("\033[1;32m| %-29s | %-27lf |\033[0m\n", "Average Total Time",
+         ave_total);
+  printf("\033[1;34m+----------------------------------------------------------"
+         "---+\033[0m\n");
 }
 
 void VIOManager::updateState(cv::Mat img, int level) {
@@ -1950,10 +2319,11 @@ void VIOManager::updateFrameState(StatesGroup state) {
   V3D Pwi(state.pos_end);
   Rcw = Rci * Rwi.transpose();
   Pcw = -Rci * Rwi.transpose() * Pwi + Pci;
-  new_frame_->T_f_w_ = SE3(Rcw, Pcw);
+  if (new_frame_ != nullptr)
+    new_frame_->T_f_w_ = SE3(Rcw, Pcw);
 }
 
-void VIOManager::plotTrackedPoints() {
+void VIOManager::plotTrackedPoints(int cam_idx) {
   int total_points = visual_submap->voxel_points.size();
   if (total_points == 0)
     return;
@@ -1984,11 +2354,11 @@ void VIOManager::plotTrackedPoints() {
 
     if (visual_submap->errors[i] <= visual_submap->propa_errors[i]) {
       // inlier_count++;
-      cv::circle(img_cp, cv::Point2f(pc[0], pc[1]), 7, cv::Scalar(0, 255, 0),
-                 -1, 8); // Green Sparse Align tracked
+      cv::circle(img_cps[cam_idx], cv::Point2f(pc[0], pc[1]), 7,
+                 cv::Scalar(0, 255, 0), -1, 8); // Green Sparse Align tracked
     } else {
-      cv::circle(img_cp, cv::Point2f(pc[0], pc[1]), 7, cv::Scalar(255, 0, 0),
-                 -1, 8); // Blue Sparse Align tracked
+      cv::circle(img_cps[cam_idx], cv::Point2f(pc[0], pc[1]), 7,
+                 cv::Scalar(255, 0, 0), -1, 8); // Blue Sparse Align tracked
     }
   }
   // std::string text = std::to_string(inlier_count) + " " +
@@ -2046,136 +2416,146 @@ void VIOManager::dumpDataForColmap() {
   cnt++;
 }
 
-void VIOManager::processFrame(
-    cv::Mat &img, multimap<double, pointWithVar> &pg,
-    const unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &feat_map,
-    double img_time) {
+// void VIOManager::processFrame(
+//     cv::Mat &img, multimap<double, pointWithVar> &pg,
+//     const unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &feat_map,
+//     double img_time) {
 
-  // img_test = img.clone();
+//   // img_test = img.clone();
 
-  if (width != img.cols || height != img.rows) {
-    if (img.empty())
-      printf("[ VIO ] Empty Image!\n");
-    cv::resize(img, img,
-               cv::Size(img.cols * image_resize_factor,
-                        img.rows * image_resize_factor),
-               0, 0, CV_INTER_LINEAR);
-  }
-  img_rgb = img.clone();
-  img_cp = img.clone();
+//   if (width != img.cols || height != img.rows) {
+//     if (img.empty())
+//       printf("[ VIO ] Empty Image!\n");
+//     cv::resize(img, img,
+//                cv::Size(img.cols * image_resize_factor,
+//                         img.rows * image_resize_factor),
+//                0, 0, CV_INTER_LINEAR);
+//   }
+//   img_rgb = img.clone();
+//   img_cp = img.clone();
 
-  if (img.channels() == 3)
-    cv::cvtColor(img, img, CV_BGR2GRAY);
+//   if (img.channels() == 3)
+//     cv::cvtColor(img, img, CV_BGR2GRAY);
 
-  new_frame_.reset(new Frame(cam, img));
-  updateFrameState(*state);
+//   new_frame_.reset(new Frame(cam, img));
+//   updateFrameState(*state);
 
-  resetGrid();
+//   resetGrid();
 
-  double t1 = omp_get_wtime();
+//   double t1 = omp_get_wtime();
 
-  retrieveFromVisualSparseMap(img, pg, feat_map);
+//   retrieveFromVisualSparseMap(img, pg, feat_map);
 
-  double t2 = omp_get_wtime();
+//   double t2 = omp_get_wtime();
 
-  computeJacobianAndUpdateEKF(img);
+//   computeJacobianAndUpdateEKF(img);
 
-  double t3 = omp_get_wtime();
+//   double t3 = omp_get_wtime();
 
-  generateVisualMapPoints(img_rgb, pg);
-  // generateVisualMapPoints(img, pg);
+//   generateVisualMapPoints(img_rgb, pg);
+//   // generateVisualMapPoints(img, pg);
 
-  double t4 = omp_get_wtime();
+//   double t4 = omp_get_wtime();
 
-  plotTrackedPoints();
+//   plotTrackedPoints();
 
-  if (plot_flag)
-    projectPatchFromRefToCur(feat_map);
+//   if (plot_flag)
+//     projectPatchFromRefToCur(feat_map);
 
-  double t5 = omp_get_wtime();
+//   double t5 = omp_get_wtime();
 
-  updateVisualMapPoints(img);
+//   updateVisualMapPoints(img);
 
-  double t6 = omp_get_wtime();
+//   double t6 = omp_get_wtime();
 
-  updateReferencePatch(feat_map);
+//   updateReferencePatch(feat_map);
 
-  double t7 = omp_get_wtime();
+//   double t7 = omp_get_wtime();
 
-  if (colmap_output_en)
-    dumpDataForColmap();
+//   if (colmap_output_en)
+//     dumpDataForColmap();
 
-  frame_count++;
-  ave_total = ave_total * (frame_count - 1) / frame_count +
-              (t7 - t1 - (t5 - t4)) / frame_count;
+//   frame_count++;
+//   ave_total = ave_total * (frame_count - 1) / frame_count +
+//               (t7 - t1 - (t5 - t4)) / frame_count;
 
-  // printf("[ VIO ] feat_map.size(): %zu\n", feat_map.size());
-  // printf("\033[1;32m[ VIO time ]: current frame: retrieveFromVisualSparseMap
-  // time: %.6lf secs.\033[0m\n", t2 - t1); printf("\033[1;32m[ VIO time ]:
-  // current frame: computeJacobianAndUpdateEKF time: %.6lf secs, comp H: %.6lf
-  // secs, ekf: %.6lf secs.\033[0m\n", t3 - t2, computeH, ekf_time);
-  // printf("\033[1;32m[ VIO time ]: current frame: generateVisualMapPoints
-  // time: %.6lf secs.\033[0m\n", t4 - t3); printf("\033[1;32m[ VIO time ]:
-  // current frame: updateVisualMapPoints time: %.6lf secs.\033[0m\n", t6 - t5);
-  // printf("\033[1;32m[ VIO time ]: current frame: updateReferencePatch time:
-  // %.6lf secs.\033[0m\n", t7 - t6); printf("\033[1;32m[ VIO time ]: current
-  // total time: %.6lf, average total time: %.6lf secs.\033[0m\n", t7 - t1 - (t5
-  // - t4), ave_total);
+//   // printf("[ VIO ] feat_map.size(): %zu\n", feat_map.size());
+//   // printf("\033[1;32m[ VIO time ]: current frame:
+//   retrieveFromVisualSparseMap
+//   // time: %.6lf secs.\033[0m\n", t2 - t1); printf("\033[1;32m[ VIO time ]:
+//   // current frame: computeJacobianAndUpdateEKF time: %.6lf secs, comp H:
+//   %.6lf
+//   // secs, ekf: %.6lf secs.\033[0m\n", t3 - t2, computeH, ekf_time);
+//   // printf("\033[1;32m[ VIO time ]: current frame: generateVisualMapPoints
+//   // time: %.6lf secs.\033[0m\n", t4 - t3); printf("\033[1;32m[ VIO time ]:
+//   // current frame: updateVisualMapPoints time: %.6lf secs.\033[0m\n", t6 -
+//   t5);
+//   // printf("\033[1;32m[ VIO time ]: current frame: updateReferencePatch
+//   time:
+//   // %.6lf secs.\033[0m\n", t7 - t6); printf("\033[1;32m[ VIO time ]: current
+//   // total time: %.6lf, average total time: %.6lf secs.\033[0m\n", t7 - t1 -
+//   (t5
+//   // - t4), ave_total);
 
-  // ave_build_residual_time = ave_build_residual_time * (frame_count - 1) /
-  // frame_count + (t2 - t1) / frame_count; ave_ekf_time = ave_ekf_time *
-  // (frame_count - 1) / frame_count + (t3 - t2) / frame_count;
+//   // ave_build_residual_time = ave_build_residual_time * (frame_count - 1) /
+//   // frame_count + (t2 - t1) / frame_count; ave_ekf_time = ave_ekf_time *
+//   // (frame_count - 1) / frame_count + (t3 - t2) / frame_count;
 
-  // cout << BLUE << "ave_build_residual_time: " << ave_build_residual_time <<
-  // RESET << endl; cout << BLUE << "ave_ekf_time: " << ave_ekf_time << RESET <<
-  // endl;
+//   // cout << BLUE << "ave_build_residual_time: " << ave_build_residual_time
+//   <<
+//   // RESET << endl; cout << BLUE << "ave_ekf_time: " << ave_ekf_time << RESET
+//   <<
+//   // endl;
 
-  printf("\033[1;34m+----------------------------------------------------------"
-         "---+\033[0m\n");
-  printf("\033[1;34m|                         VIO Time                         "
-         "   |\033[0m\n");
-  printf("\033[1;34m+----------------------------------------------------------"
-         "---+\033[0m\n");
-  printf("\033[1;34m| %-29s | %-27zu |\033[0m\n", "Sparse Map Size",
-         feat_map.size());
-  printf("\033[1;34m+----------------------------------------------------------"
-         "---+\033[0m\n");
-  printf("\033[1;34m| %-29s | %-27s |\033[0m\n", "Algorithm Stage",
-         "Time (secs)");
-  printf("\033[1;34m+----------------------------------------------------------"
-         "---+\033[0m\n");
-  printf("\033[1;32m| %-29s | %-27lf |\033[0m\n", "retrieveFromVisualSparseMap",
-         t2 - t1);
-  printf("\033[1;32m| %-29s | %-27lf |\033[0m\n", "computeJacobianAndUpdateEKF",
-         t3 - t2);
-  printf("\033[1;32m| %-27s   | %-27lf |\033[0m\n", "-> computeJacobian",
-         compute_jacobian_time);
-  printf("\033[1;32m| %-27s   | %-27lf |\033[0m\n", "-> updateEKF",
-         update_ekf_time);
-  printf("\033[1;32m| %-29s | %-27lf |\033[0m\n", "generateVisualMapPoints",
-         t4 - t3);
-  printf("\033[1;32m| %-29s | %-27lf |\033[0m\n", "updateVisualMapPoints",
-         t6 - t5);
-  printf("\033[1;32m| %-29s | %-27lf |\033[0m\n", "updateReferencePatch",
-         t7 - t6);
-  printf("\033[1;34m+----------------------------------------------------------"
-         "---+\033[0m\n");
-  printf("\033[1;32m| %-29s | %-27lf |\033[0m\n", "Current Total Time",
-         t7 - t1 - (t5 - t4));
-  printf("\033[1;32m| %-29s | %-27lf |\033[0m\n", "Average Total Time",
-         ave_total);
-  printf("\033[1;34m+----------------------------------------------------------"
-         "---+\033[0m\n");
+//   printf("\033[1;34m+----------------------------------------------------------"
+//          "---+\033[0m\n");
+//   printf("\033[1;34m|                         VIO Time "
+//          "   |\033[0m\n");
+//   printf("\033[1;34m+----------------------------------------------------------"
+//          "---+\033[0m\n");
+//   printf("\033[1;34m| %-29s | %-27zu |\033[0m\n", "Sparse Map Size",
+//          feat_map.size());
+//   printf("\033[1;34m+----------------------------------------------------------"
+//          "---+\033[0m\n");
+//   printf("\033[1;34m| %-29s | %-27s |\033[0m\n", "Algorithm Stage",
+//          "Time (secs)");
+//   printf("\033[1;34m+----------------------------------------------------------"
+//          "---+\033[0m\n");
+//   printf("\033[1;32m| %-29s | %-27lf |\033[0m\n",
+//   "retrieveFromVisualSparseMap",
+//          t2 - t1);
+//   printf("\033[1;32m| %-29s | %-27lf |\033[0m\n",
+//   "computeJacobianAndUpdateEKF",
+//          t3 - t2);
+//   printf("\033[1;32m| %-27s   | %-27lf |\033[0m\n", "-> computeJacobian",
+//          compute_jacobian_time);
+//   printf("\033[1;32m| %-27s   | %-27lf |\033[0m\n", "-> updateEKF",
+//          update_ekf_time);
+//   printf("\033[1;32m| %-29s | %-27lf |\033[0m\n", "generateVisualMapPoints",
+//          t4 - t3);
+//   printf("\033[1;32m| %-29s | %-27lf |\033[0m\n", "updateVisualMapPoints",
+//          t6 - t5);
+//   printf("\033[1;32m| %-29s | %-27lf |\033[0m\n", "updateReferencePatch",
+//          t7 - t6);
+//   printf("\033[1;34m+----------------------------------------------------------"
+//          "---+\033[0m\n");
+//   printf("\033[1;32m| %-29s | %-27lf |\033[0m\n", "Current Total Time",
+//          t7 - t1 - (t5 - t4));
+//   printf("\033[1;32m| %-29s | %-27lf |\033[0m\n", "Average Total Time",
+//          ave_total);
+//   printf("\033[1;34m+----------------------------------------------------------"
+//          "---+\033[0m\n");
 
-  // std::string text = std::to_string(int(1 / (t7 - t1 - (t5 - t4)))) + " HZ";
-  // cv::Point2f origin;
-  // origin.x = 20;
-  // origin.y = 20;
-  // cv::putText(img_cp, text, origin, cv::FONT_HERSHEY_COMPLEX, 0.6,
-  // cv::Scalar(255, 255, 255), 1, 8, 0);
-  // cv::imwrite("/home/chunran/Desktop/raycasting/" +
-  // std::to_string(new_frame_->id_) + ".png", img_cp);
-}
+//   // std::string text = std::to_string(int(1 / (t7 - t1 - (t5 - t4)))) + "
+//   HZ";
+//   // cv::Point2f origin;
+//   // origin.x = 20;
+//   // origin.y = 20;
+//   // cv::putText(img_cp, text, origin, cv::FONT_HERSHEY_COMPLEX, 0.6,
+//   // cv::Scalar(255, 255, 255), 1, 8, 0);
+//   // cv::imwrite("/home/chunran/Desktop/raycasting/" +
+//   // std::to_string(new_frame_->id_) + ".png", img_cp);
+// }
 
 // sync_packages에서 계산된 시간 오프셋을 VIOManager로 전달하는 함수
 void VIOManager::setCameraTimeOffsets(
@@ -2192,22 +2572,20 @@ void VIOManager::setCameraTimeOffsets(
 
 // 원본 외향 매개변수를 백업하는 함수
 void VIOManager::backupOriginalExtrinsics() {
-  original_Rci = this->Rci;
-  original_Pci = this->Pci;
-  original_Rcl = this->Rcl;
-  original_Pcl = this->Pcl;
-  original_Jdphi_dR = this->Jdphi_dR;
-  original_Jdp_dR = this->Jdp_dR;
+  original_Rci_vec = this->m_R_c_i_vec;
+  original_Pci_vec = this->m_P_c_i_vec;
+  original_Rcl_vec = this->m_R_c_l_vec;
+  original_Pcl_vec = this->m_P_c_l_vec;
+  // original_Jdphi_dR = this->Jdphi_dR;
+  // original_Jdp_dR = this->Jdp_dR;
 }
 
 // 백업된 원본 외향 매개변수로 복원하는 함수
 void VIOManager::restoreOriginalExtrinsics() {
-  this->Rci = original_Rci;
-  this->Pci = original_Pci;
-  this->Rcl = original_Rcl;
-  this->Pcl = original_Pcl;
-  this->Jdphi_dR = original_Jdphi_dR;
-  this->Jdp_dR = original_Jdp_dR;
+  this->m_R_c_i_vec = original_Rci_vec;
+  this->m_P_c_i_vec = original_Pci_vec;
+  this->m_R_c_l_vec = original_Rcl_vec;
+  this->m_P_c_l_vec = original_Pcl_vec;
 }
 
 void VIOManager::compensateExtrinsicsByTimeOffset(
@@ -2266,21 +2644,16 @@ void VIOManager::compensateExtrinsicsByTimeOffset(
   M3D R_kf_img = R_w_kf.transpose() * R_w_img;
   V3D P_kf_img = R_w_kf.transpose() * (P_w_img - P_w_kf);
 
-  backupOriginalExtrinsics();
-
   M3D R_img_kf = R_kf_img.transpose();
   V3D P_img_kf = -R_img_kf * P_kf_img;
 
-  this->Rci = original_Rci * R_img_kf;
-  this->Pci = original_Rci * P_img_kf + original_Pci;
+  this->m_R_c_i_vec[cam_idx] = original_Rci_vec[cam_idx] * R_img_kf;
+  this->m_P_c_i_vec[cam_idx] =
+      original_Rci_vec[cam_idx] * P_img_kf + original_Pci_vec[cam_idx];
+  this->m_R_c_l_vec[cam_idx] = original_Rci_vec[cam_idx] * Rli.transpose();
+  this->m_P_c_l_vec[cam_idx] =
+      original_Pci_vec[cam_idx] +
+      original_Rci_vec[cam_idx] * (-Rli.transpose() * Pli);
 
-  this->Rcl = Rci * Rli.transpose();
-  this->Pcl = Pci + Rci * (-Rli.transpose() * Pli);
-
-  V3D Pic;
-  M3D tmp;
-  this->Jdphi_dR = this->Rci;
-  Pic = -this->Rci.transpose() * this->Pci;
-  tmp << SKEW_SYM_MATRX(Pic);
-  this->Jdp_dR = -this->Rci * tmp;
+  setCameraByIndex(cam_idx);
 }

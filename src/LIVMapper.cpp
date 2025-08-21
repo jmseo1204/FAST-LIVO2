@@ -169,6 +169,9 @@ void LIVMapper::initializeComponents() {
   for (int i = 0; i < num_of_cam; ++i) {
     last_timestamp_imgs[i] = -1.0;
     if (!vk::camera_loader::loadFromRosNs("laserMapping",
+                                          vio_manager->m_cameras[i]) &&
+        !vk::camera_loader::loadFromRosNs("laserMapping/cam_" +
+                                              std::to_string(i + 1),
                                           vio_manager->m_cameras[i]))
       throw std::runtime_error("Camera model not correctly specified.");
   }
@@ -394,34 +397,18 @@ void LIVMapper::handleVIO() {
     pub_num++;
   }
 
-  for (size_t i = 0; i < m.imgs.size(); ++i) {
-    cv::Mat &current_img = m.imgs[i];
+  vio_manager->processMultiCamVIO(
+      m.imgs, m.img_camera_indices, imu_poses, _pv_prev,
+      voxelmap_manager->voxel_map_,
+      LidarMeasures.last_lio_update_time - _first_lidar_time, en_cam_backprop);
+
+  for (size_t i = 0; i < m.img_camera_indices.size(); ++i) {
     int cam_idx = m.img_camera_indices[i];
-
-    // [ ONLY SIDE CAMERA ]
-    // if (cam_idx == 0 || cam_idx == 2)
-    //   continue;
-
-    std::cout << "[ VIO ] Processing for camera index: " << cam_idx
-              << std::endl;
-
-    if (en_cam_backprop) {
-      vio_manager->compensateExtrinsicsByTimeOffset(imu_poses, cam_idx);
-    } else {
-      vio_manager->setCameraByIndex(cam_idx);
-    }
-
-    vio_manager->processFrame(
-        current_img, _pv_prev, voxelmap_manager->voxel_map_,
-        LidarMeasures.last_lio_update_time - _first_lidar_time);
-
-    publish_img_rgb(pubImages[cam_idx], vio_manager);
-
-    publish_frame_world(publish_frame, pubLaserCloudFullRes, vio_manager);
-
-    vio_manager->restoreOriginalExtrinsics();
+    vio_manager->setCameraByIndex(cam_idx);
+    publish_img_rgb(pubImages[cam_idx], vio_manager, cam_idx);
+    publish_frame_world(publish_frame, pubLaserCloudFullRes, vio_manager,
+                        cam_idx);
   }
-
   if (publish_frame) {
     PointCloudXYZI().swap(*pcl_wait_pub);
   }
@@ -433,18 +420,6 @@ void LIVMapper::handleVIO() {
     latest_ekf_time = LidarMeasures.last_lio_update_time;
     state_update_flg = true;
   }
-
-  // int size_sub_map = vio_manager->visual_sub_map_cur.size();
-  // visual_sub_map->reserve(size_sub_map);
-  // for (int i = 0; i < size_sub_map; i++)
-  // {
-  //   PointType temp_map;
-  //   temp_map.x = vio_manager->visual_sub_map_cur[i]->pos_[0];
-  //   temp_map.y = vio_manager->visual_sub_map_cur[i]->pos_[1];
-  //   temp_map.z = vio_manager->visual_sub_map_cur[i]->pos_[2];
-  //   temp_map.intensity = 0.;
-  //   visual_sub_map->push_back(temp_map);
-  // }
 
   euler_cur = RotMtoEuler(_state.rot_end);
   fout_out << std::setw(20)
@@ -584,9 +559,11 @@ void LIVMapper::handleLIO() {
   // std::cout << "[ _pv_prev.size() ] : " << _pv_prev.size() << std::endl;
 
   // std::cout << "[ _pv_prev.front().timestamp] : " << std::fixed
-  //           << std::setprecision(6) << _pv_prev.begin()->first << std::endl;
+  //           << std::setprecision(6) << _pv_prev.begin()->first <<
+  //           std::endl;
   // std::cout << "[ _pv_prev.back().timestamp] : " << std::fixed
-  //           << std::setprecision(6) << _pv_prev.rbegin()->first << std::endl;
+  //           << std::setprecision(6) << _pv_prev.rbegin()->first <<
+  //           std::endl;
 
   // std::cout << "[ _pv_prev list ]" << std::endl;
   // for (int i = 0; i < (5 < _pv_prev.size() ? 5 : _pv_prev.size()); i++) {
@@ -630,6 +607,7 @@ void LIVMapper::handleLIO() {
   PointCloudXYZI::Ptr laserCloudWorld(new PointCloudXYZI());
   laserCloudWorld->reserve(_pv_prev.size());
 
+  // std::cout << "handleLIO _pv_prev size: " << _pv_prev.size() << std::endl;
   for (const auto &pair : _pv_prev) {
     const auto &pv = pair.second;
     PointType point;
@@ -644,7 +622,9 @@ void LIVMapper::handleLIO() {
   *pcl_w_wait_pub = *laserCloudWorld;
 
   if (!img_en)
-    publish_frame_world(true, pubLaserCloudFullRes, vio_manager);
+    // std::cout << "handleLIO publish_frame_world: "
+    //           << pcl_w_wait_pub->points.size() << std::endl;
+    publish_frame_world(true, pubLaserCloudFullRes, vio_manager, -1);
   if (pub_effect_point_en)
     publish_effect_world(pubLaserCloudEffect, voxelmap_manager->ptpl_list_);
   if (voxelmap_manager->config_setting_.is_pub_plane_map_)
@@ -669,11 +649,11 @@ void LIVMapper::handleLIO() {
   //         t1, t5 - t3, t5 - t0, aver_time_icp, aver_time_const_H_time,
   //         aver_time_consu);
 
-  // printf("\033[1;36m[ LIO mapping time ]: current scan: icp: %0.6f secs, map
-  // incre: %0.6f secs, total: %0.6f secs.\033[0m\n"
+  // printf("\033[1;36m[ LIO mapping time ]: current scan: icp: %0.6f secs,
+  // map incre: %0.6f secs, total: %0.6f secs.\033[0m\n"
   //         "\033[1;36m[ LIO mapping time ]: average: icp: %0.6f secs, map
-  //         incre: %0.6f secs, total: %0.6f secs.\033[0m\n", t2 - t1, t4 - t3,
-  //         t4 - t0, aver_time_icp, aver_time_map_inre, aver_time_consu);
+  //         incre: %0.6f secs, total: %0.6f secs.\033[0m\n", t2 - t1, t4 -
+  //         t3, t4 - t0, aver_time_icp, aver_time_map_inre, aver_time_consu);
   printf("\033[1;34m+----------------------------------------------------------"
          "---+\033[0m\n");
   printf("\033[1;34m|                         LIO Mapping Time                 "
@@ -761,6 +741,14 @@ void LIVMapper::savePCD() {
 }
 
 void LIVMapper::run() {
+  // 초기에 TUM trajectory 파일 경로 생성
+  // std::string tum_output_path = std::string(ROOT_DIR) + "/Log/" +
+  //                               std::to_string(ros::Time::now().toSec()) +
+  //                               "_tum.txt";
+  std::string tum_output_path =
+      "/mnt/c/Users/USER/Desktop/fast_livo2/results/" +
+      std::to_string(int(ros::Time::now().toSec()) % 10000) + ".txt";
+
   ros::Rate rate(5000);
   while (ros::ok()) {
     ros::spinOnce(); // 처음에만 기본 ros제공 쓰고 나머지는 커스텀하려고
@@ -777,8 +765,8 @@ void LIVMapper::run() {
     // if (!p_imu->imu_time_init) continue;
 
     stateEstimationAndMapping();
-
-    save_path_to_file();
+    if (!img_en || LidarMeasures.lio_vio_flg == VIO)
+      save_path_to_file(tum_output_path);
   }
   savePCD();
 }
@@ -1068,7 +1056,8 @@ void LIVMapper::img_cbk(const sensor_msgs::ImageConstPtr &msg_in, int cam_idx) {
     return;
   sensor_msgs::Image::Ptr msg(new sensor_msgs::Image(*msg_in));
   // std::cout << "[DEBUG] img_cbk called! timestamp: " <<
-  // msg->header.stamp.toSec() << std::endl; if ((abs(msg->header.stamp.toSec()
+  // msg->header.stamp.toSec() << std::endl; if
+  // ((abs(msg->header.stamp.toSec()
   // - last_timestamp_img) > 0.2 && last_timestamp_img > 0) || sync_jump_flag)
   // {
   //   ROS_WARN("img jumps %.3f\n", msg->header.stamp.toSec() -
@@ -1121,541 +1110,386 @@ void LIVMapper::img_cbk(const sensor_msgs::ImageConstPtr &msg_in, int cam_idx) {
   sig_buffer.notify_all();
 }
 
-// bool LIVMapper::sync_packages(LidarMeasureGroup &meas) {
-//   if (lid_raw_data_buffer.empty() && lidar_en)
-//     return false;
-//   if (img_buffer.empty() && img_en)
-//     return false;
-//   if (imu_buffer.empty() && imu_en)
-//     return false;
-
-//   switch (slam_mode_) {
-//   case ONLY_LIO: {
-//     if (meas.last_lio_update_time < 0.0)
-//       meas.last_lio_update_time = lid_header_time_buffer.front();
-//     if (!lidar_pushed) {
-//       // If not push the lidar into measurement data buffer
-//       meas.lidar = lid_raw_data_buffer.front(); // push the first lidar topic
-//       if (meas.lidar->points.size() <= 1)
-//         return false;
-
-//       meas.lidar_frame_beg_time =
-//           lid_header_time_buffer.front(); // generate lidar_frame_beg_time
-//       meas.lidar_frame_end_time =
-//           meas.lidar_frame_beg_time +
-//           meas.lidar->points.back().curvature / double(1000); // calc lidar
-//       meas.pcl_proc_cur = meas.lidar;
-//       lidar_pushed = true; // flag
-//     }
-
-//     if (imu_en &&
-//         last_timestamp_imu <
-//             meas.lidar_frame_end_time) { // waiting imu message needs to be
-//       // larger than _lidar_frame_end_time,
-//       // make sure complete propagate.
-//       // ROS_ERROR("out sync");
-//       return false;
-//     }
-
-//     struct MeasureGroup m; // standard method to keep imu message.
-
-//     m.imu.clear();
-//     m.lio_time = meas.lidar_frame_end_time;
-//     mtx_buffer.lock();
-//     while (!imu_buffer.empty()) {
-//       if (imu_buffer.front()->header.stamp.toSec() >
-//       meas.lidar_frame_end_time)
-//         break;
-//       m.imu.push_back(imu_buffer.front());
-//       imu_buffer.pop_front();
-//     }
-//     lid_raw_data_buffer.pop_front();
-//     lid_header_time_buffer.pop_front();
-//     mtx_buffer.unlock();
-//     sig_buffer.notify_all();
-
-//     meas.lio_vio_flg =
-//         LIO; // process lidar topic, so timestamp should be lidar scan end.
-//     meas.measures.push_back(m);
-//     // ROS_INFO("ONlY HAS LiDAR and IMU, NO IMAGE!");
-//     lidar_pushed = false; // sync one whole lidar scan.
-//     return true;
-
-//     break;
-//   }
-
-//   case LIVO: {
-//     /*** For LIVO mode, the time of LIO update is set to be the same as VIO,
-//     LIO
-//      * first than VIO imediatly ***/
-//     EKF_STATE last_lio_vio_flg = meas.lio_vio_flg;
-//     // double t0 = omp_get_wtime();
-//     switch (last_lio_vio_flg) {
-//       // double img_capture_time = meas.lidar_frame_beg_time +
-//       exposure_time_init;
-//     case WAIT:
-//     case VIO: {
-//       // printf("!!! meas.lio_vio_flg: %d \n", meas.lio_vio_flg);
-//       double img_capture_time = img_time_buffer.front() + exposure_time_init;
-//       /*** has img topic, but img topic timestamp larger than lidar end time,
-//        * process lidar topic. After LIO update, the meas.lidar_frame_end_time
-//        * will be refresh. ***/
-//       if (meas.last_lio_update_time < 0.0)
-//         meas.last_lio_update_time = lid_header_time_buffer.front();
-//       // printf("[ Data Cut ] wait \n");
-//       // printf("[ Data Cut ] last_lio_update_time: %lf \n",
-//       // meas.last_lio_update_time);
-
-//       double lid_newest_time =
-//           lid_header_time_buffer.back() +
-//           lid_raw_data_buffer.back()->points.back().curvature / double(1000);
-//       double imu_newest_time = imu_buffer.back()->header.stamp.toSec();
-
-//       if (img_capture_time < meas.last_lio_update_time + 0.00001) {
-//         img_buffer.pop_front();
-//         img_time_buffer.pop_front();
-//         ROS_ERROR("[ Data Cut ] Throw one image frame! \n");
-//         return false;
-//       }
-
-//       if (img_capture_time > lid_newest_time ||
-//           img_capture_time > imu_newest_time) {
-//         // ROS_ERROR("lost first camera frame");
-//         // printf("img_capture_time, lid_newest_time, imu_newest_time: %lf ,
-//         // , %lf \n", img_capture_time, lid_newest_time, imu_newest_time);
-//         return false;
-//       }
-
-//       struct MeasureGroup m;
-
-//       // printf("[ Data Cut ] LIO \n");
-//       // printf("[ Data Cut ] img_capture_time: %lf \n", img_capture_time);
-//       m.imu.clear();
-//       m.lio_time = img_capture_time;
-//       mtx_buffer.lock();
-//       while (!imu_buffer.empty()) {
-//         if (imu_buffer.front()->header.stamp.toSec() > m.lio_time)
-//           break;
-
-//         if (imu_buffer.front()->header.stamp.toSec() >
-//             meas.last_lio_update_time)
-//           m.imu.push_back(imu_buffer.front());
-
-//         imu_buffer.pop_front();
-//         // printf("[ Data Cut ] imu time: %lf \n",
-//         // imu_buffer.front()->header.stamp.toSec());
-//       }
-//       mtx_buffer.unlock();
-//       sig_buffer.notify_all();
-
-//       *(meas.pcl_proc_cur) = *(meas.pcl_proc_next);
-//       PointCloudXYZI().swap(*meas.pcl_proc_next);
-
-//       int lid_frame_num = lid_raw_data_buffer.size();
-//       int max_size =
-//           meas.pcl_proc_cur->size() + 24000 * lid_frame_num; // max사이즈
-//       meas.pcl_proc_cur->reserve(max_size);
-//       meas.pcl_proc_next->reserve(max_size);
-//       // deque<PointCloudXYZI::Ptr> lidar_buffer_tmp;
-
-//       while (!lid_raw_data_buffer.empty())
-
-//       {
-//         if (lid_header_time_buffer.front() > img_capture_time)
-//           break;
-//         auto pcl(lid_raw_data_buffer.front()->points);
-//         double frame_header_time(lid_header_time_buffer.front());
-//         float max_offs_time_ms = (m.lio_time - frame_header_time) * 1000.0f;
-
-//         for (int i = 0; i < pcl.size(); i++) {
-//           auto pt = pcl[i];
-//           if (pcl[i].curvature < max_offs_time_ms) {
-//             pt.curvature +=
-//                 (frame_header_time - meas.last_lio_update_time) * 1000.0f;
-//             meas.pcl_proc_cur->points.push_back(pt);
-//           } else {
-//             pt.curvature += (frame_header_time - m.lio_time) * 1000.0f;
-//             meas.pcl_proc_next->points.push_back(pt);
-//           }
-//         }
-//         lid_raw_data_buffer.pop_front();
-//         lid_header_time_buffer.pop_front();
-//       }
-
-//       meas.measures.push_back(m);
-//       meas.lio_vio_flg = LIO;
-//       // meas.last_lio_update_time = m.lio_time;
-//       // printf("!!! meas.lio_vio_flg: %d \n", meas.lio_vio_flg);
-//       // printf("[ Data Cut ] pcl_proc_cur number: %d \n", meas.pcl_proc_cur
-//       // ->points.size()); printf("[ Data Cut ] LIO process time: %lf \n",
-//       // omp_get_wtime() - t0);
-//       return true;
-//     }
-
-//     case LIO: {
-//       double img_capture_time = img_time_buffer.front() + exposure_time_init;
-//       meas.lio_vio_flg = VIO;
-//       // printf("[ Data Cut ] VIO \n");
-//       meas.measures.clear();
-//       double imu_time = imu_buffer.front()->header.stamp.toSec();
-
-//       struct MeasureGroup m;
-//       m.vio_time = img_capture_time;
-//       m.lio_time = meas.last_lio_update_time;
-//       m.img = img_buffer.front();
-//       mtx_buffer.lock();
-//       // while ((!imu_buffer.empty() && (imu_time < img_capture_time)))
-//       // {
-//       //   imu_time = imu_buffer.front()->header.stamp.toSec();
-//       //   if (imu_time > img_capture_time) break;
-//       //   m.imu.push_back(imu_buffer.front());
-//       //   imu_buffer.pop_front();
-//       //   printf("[ Data Cut ] imu time: %lf \n",
-//       //   imu_buffer.front()->header.stamp.toSec());
-//       // }
-//       img_buffer.pop_front();
-//       img_time_buffer.pop_front();
-//       mtx_buffer.unlock();
-//       sig_buffer.notify_all();
-//       meas.measures.push_back(m);
-//       lidar_pushed = false;
-//       // after VIO update, the _lidar_frame_end_time will be refresh.
-//       // printf("[ Data Cut ] VIO process time: %lf \n", omp_get_wtime()
-//       // -t0);
-//       return true;
-//     }
-
-//     default: {
-//       // printf("!! WRONG EKF STATE !!");
-//       return false;
-//     }
-//       // return false;
-//     }
-//     break;
-//   }
-
-//   case ONLY_LO: {
-//     if (!lidar_pushed) {
-//       // If not in lidar scan, need to generate new meas
-//       if (lid_raw_data_buffer.empty())
-//         return false;
-//       meas.lidar = lid_raw_data_buffer.front(); // push the first lidar topic
-//       meas.lidar_frame_beg_time =
-//           lid_header_time_buffer.front(); // generate lidar_beg_time
-//       meas.lidar_frame_end_time =
-//           meas.lidar_frame_beg_time +
-//           meas.lidar->points.back().curvature / double(1000);
-//       lidar_pushed = true;
-//     }
-//     struct MeasureGroup m; // standard method to keep imu message.
-//     m.lio_time = meas.lidar_frame_end_time;
-//     mtx_buffer.lock();
-//     lid_raw_data_buffer.pop_front();
-//     lid_header_time_buffer.pop_front();
-//     mtx_buffer.unlock();
-//     sig_buffer.notify_all();
-//     lidar_pushed = false; // sync one whole lidar scan.
-//     meas.lio_vio_flg = LO;
-//     // process lidar topic, so timestamp should be lidar scan end.
-//     meas.measures.push_back(m);
-//     return true;
-//     break;
-//   }
-
-//   default: {
-//     printf("!! WRONG SLAM TYPE !!");
-//     return false;
-//   }
-//   }
-//   ROS_ERROR("out sync");
-// }
-
 bool LIVMapper::sync_packages(LidarMeasureGroup &meas) {
-  // std::cout << std::fixed << std::setprecision(9)
-  //           << "[DEBUG] sync_packages called! timestamp: "
-  //           << meas.last_lio_update_time << std::endl;
-
-  if (lid_raw_data_buffer.empty() || imu_buffer.empty()) {
+  if (lid_raw_data_buffer.empty() && lidar_en)
     return false;
-  }
+  if (imu_buffer.empty() && imu_en)
+    return false;
 
-  double min_time_start = std::numeric_limits<double>::max();
-  for (int i = 0; i < m_img_buffers.size(); i++) {
-    while (!m_img_time_buffers[i].empty() &&
-           m_img_time_buffers[i].front() <
-               meas.last_lio_update_time + 0.00001) {
-      m_img_time_buffers[i].pop_front();
-      m_img_buffers[i].pop_front();
+  switch (slam_mode_) {
+  case ONLY_LIO: {
+    if (meas.last_lio_update_time < 0.0)
+      meas.last_lio_update_time = lid_header_time_buffer.front();
+    if (!lidar_pushed) {
+      // If not push the lidar into measurement data buffer
+      meas.lidar = lid_raw_data_buffer.front(); // push the first lidar
+      if (meas.lidar->points.size() <= 1)
+        return false;
+
+      meas.lidar_frame_beg_time =
+          lid_header_time_buffer.front(); // generate lidar_frame_beg_time
+      meas.lidar_frame_end_time =
+          meas.lidar_frame_beg_time +
+          meas.lidar->points.back().curvature / double(1000); // calc lidar
+      meas.pcl_proc_cur = meas.lidar;
+      lidar_pushed = true; // flag
     }
 
-    if (!m_img_time_buffers[i].empty()) {
-      min_time_start = min_time_start > m_img_time_buffers[i].front()
-                           ? m_img_time_buffers[i].front()
-                           : min_time_start;
-      // min_time_start = m_img_time_buffers[0].front();
-    } else {
-      return false;
-    }
-  }
-
-  EKF_STATE last_lio_vio_flg = meas.lio_vio_flg;
-  switch (last_lio_vio_flg) {
-  case WAIT:
-  case VIO: {
-
-    double time_window = time_window_;
-
-    if (meas.last_lio_update_time <= 0.0)
-      meas.last_lio_update_time = lid_header_time_buffer.front() - 0.00001;
-
-    double end_time = min_time_start + time_window;
-
-    std::map<int, std::pair<double, cv::Mat>> candidates;
-
-    double key_frame_time;
-    vector<double> key_frame_times;
-
-    // [DEBUG]
-    const char block = '#';
-    const double time_unit = 0.01; // 0.01초 = 공백 1칸
-
-    vector<double> fronts;
-    for (const auto &buf : m_img_time_buffers) {
-      if (!buf.empty()) {
-        fronts.push_back(buf.front());
-      } else {
-        fronts.push_back(numeric_limits<double>::max());
-      }
-    }
-    double min_time = *min_element(fronts.begin(), fronts.end());
-
-    for (size_t i = 0; i < m_img_time_buffers.size(); ++i) {
-      size_t size = m_img_time_buffers[i].size();
-      if (size == 0) {
-        cout << "Buffer " << i << ": (empty)" << endl;
-        continue;
-      }
-
-      double offset = fronts[i] - min_time;
-      int spaces = static_cast<int>(round(offset / time_unit));
-
-      cout << "Buffer " << i << ": ";
-      cout << string(spaces, ' ');
-      cout << string(size, block);
-      cout << " (" << size << ", offset: " << fixed << setprecision(6) << offset
-           << "s)" << endl;
-    }
-
-    int min_idx = -1;
-    for (int i = 0; i < num_of_cam; i++) {
-      if (m_img_time_buffers[i].empty()) {
-        std::cout << "channel pass(empty): " << i << std::endl;
-      }
-
-      double current_img_time = m_img_time_buffers[i].front();
-
-      if (current_img_time >= end_time) {
-        std::cout << std::fixed << std::setprecision(4)
-                  << "channel pass(over): " << i << " - " << current_img_time
-                  << std::endl;
-        continue;
-      }
-
-      double capture_time = current_img_time + exposure_time_init;
-      cv::Mat image = m_img_buffers[i].front();
-      candidates[i] = {capture_time, image};
-      key_frame_times.push_back(capture_time);
-      min_idx = min_idx == -1
-                    ? i
-                    : (m_img_time_buffers[min_idx].front() > current_img_time
-                           ? i
-                           : min_idx);
-    }
-
-    if (candidates.empty()) {
-      std::cout << "No Candidates" << std::endl;
-      return false;
-    } else if (candidates.size() < minimum_simultaneous_frame_num) {
-      std::cout << "Below minimum Candidates" << std::endl;
-      m_img_time_buffers[min_idx].pop_front();
-      m_img_buffers[min_idx].pop_front();
+    if (imu_en &&
+        last_timestamp_imu <
+            meas.lidar_frame_end_time) { // waiting imu message needs to be
+      // larger than _lidar_frame_end_time,
+      // make sure complete propagate.
+      // ROS_ERROR("out sync");
       return false;
     }
 
-    key_frame_time =
-        *std::max_element(key_frame_times.begin(), key_frame_times.end());
-
-    m_candidates = candidates;
-
-    std::cout << "candidates: " << candidates.size() << std::endl;
-
-    std::map<int, double> time_offsets_from_last_update;
-    for (const auto &cand : m_candidates) {
-      int cam_idx = cand.first;
-      double capture_time = cand.second.first;
-      // last_lio_update_time으로부터 각 이미지 캡처 시간까지의 시간 간격을 저장
-      time_offsets_from_last_update[cam_idx] =
-          capture_time - meas.last_lio_update_time;
-    }
-    vio_manager->setCameraTimeOffsets(time_offsets_from_last_update);
-
-    meas.measures.clear();
-
-    double lid_newest_time =
-        lid_header_time_buffer.back() +
-        lid_raw_data_buffer.back()->points.back().curvature / 1000.0;
-    double imu_newest_time = imu_buffer.back()->header.stamp.toSec();
-
-    if (key_frame_time > lid_newest_time) {
-      std::cout << std::fixed << std::setprecision(6)
-                << "[sync false] lid < key_frame: " << lid_newest_time << "<"
-                << key_frame_time << std::endl;
-      return false;
-    }
-
-    if (key_frame_time > imu_newest_time) {
-      std::cout << std::fixed << std::setprecision(6)
-                << "[sync false] IMU < key_frame: " << imu_newest_time << "<"
-                << key_frame_time << std::endl;
-      return false;
-    }
-
-    for (int i = 0; i < num_of_cam; i++) {
-      if (candidates.count(i)) {
-        m_img_time_buffers[i].pop_front();
-        m_img_buffers[i].pop_front();
-      }
-    }
-
-    if ((meas.pcl_proc_next->size() == 0 &&
-         key_frame_time < lid_header_time_buffer.front())) {
-      std::cout << "No pcl pending" << std::endl;
-      return false;
-    }
-
-    struct MeasureGroup m;
+    struct MeasureGroup m; // standard method to keep imu message.
 
     m.imu.clear();
-    m.lio_time = key_frame_time;
-    m.vio_time = key_frame_time;
+    m.lio_time = meas.lidar_frame_end_time;
     mtx_buffer.lock();
-
-    while (!imu_buffer.empty() && imu_buffer.front()->header.stamp.toSec() <
-                                      meas.last_lio_update_time) {
-      imu_buffer.pop_front(); // 오래된 IMU 데이터 제거
-    }
-    while (!imu_buffer.empty() &&
-           imu_buffer.front()->header.stamp.toSec() <= key_frame_time) {
+    while (!imu_buffer.empty()) {
+      if (imu_buffer.front()->header.stamp.toSec() > meas.lidar_frame_end_time)
+        break;
       m.imu.push_back(imu_buffer.front());
       imu_buffer.pop_front();
     }
+    lid_raw_data_buffer.pop_front();
+    lid_header_time_buffer.pop_front();
     mtx_buffer.unlock();
     sig_buffer.notify_all();
 
-    *(meas.pcl_proc_cur) = *(meas.pcl_proc_next);
+    meas.lio_vio_flg =
+        LIO; // process lidar topic, so timestamp should be lidar scan end.
+    meas.measures.push_back(m);
+    // ROS_INFO("ONlY HAS LiDAR and IMU, NO IMAGE!");
+    lidar_pushed = false; // sync one whole lidar scan.
+    return true;
 
-    PointCloudXYZI().swap(*meas.pcl_proc_next);
+    break;
+  }
 
-    int lid_frame_num = lid_raw_data_buffer.size();
-    int max_size = meas.pcl_proc_cur->size() + 24000 * lid_frame_num;
-    meas.pcl_proc_cur->reserve(max_size);
-    meas.pcl_proc_next->reserve(max_size);
-
-    while (!lid_raw_data_buffer.empty()) {
-      if (lid_header_time_buffer.front() > key_frame_time)
-        break;
-      auto pcl(lid_raw_data_buffer.front()->points);
-      double frame_header_time(lid_header_time_buffer.front());
-
-      for (int i = 0; i < pcl.size(); i++) {
-        auto pt = pcl[i];
-        pt.curvature +=
-            (frame_header_time - meas.last_lio_update_time) * 1000.0f;
-        meas.pcl_proc_cur->points.push_back(pt);
+  case LIVO: {
+    double min_time_start = std::numeric_limits<double>::max();
+    for (int i = 0; i < m_img_buffers.size(); i++) {
+      while (!m_img_time_buffers[i].empty() &&
+             m_img_time_buffers[i].front() <
+                 meas.last_lio_update_time + 0.00001) {
+        m_img_time_buffers[i].pop_front();
+        m_img_buffers[i].pop_front();
       }
-      lid_raw_data_buffer.pop_front();
-      lid_header_time_buffer.pop_front();
+
+      if (!m_img_time_buffers[i].empty()) {
+        min_time_start = min_time_start > m_img_time_buffers[i].front()
+                             ? m_img_time_buffers[i].front()
+                             : min_time_start;
+        // min_time_start = m_img_time_buffers[0].front();
+      } else {
+        return false;
+      }
     }
 
-    while (!meas.pcl_proc_cur->points.empty() &&
-           meas.pcl_proc_cur->points.back().curvature >
-               (m.lio_time - meas.last_lio_update_time) * 1000.0f) {
-      auto pt = meas.pcl_proc_cur->points.back();
-      pt.curvature += (meas.last_lio_update_time - m.lio_time) * 1000.0f;
-      meas.pcl_proc_next->points.push_back(pt);
-      meas.pcl_proc_cur->points.pop_back();
+    EKF_STATE last_lio_vio_flg = meas.lio_vio_flg;
+    switch (last_lio_vio_flg) {
+    case WAIT:
+    case VIO: {
+
+      double time_window = time_window_;
+
+      if (meas.last_lio_update_time <= 0.0)
+        meas.last_lio_update_time = lid_header_time_buffer.front() - 0.00001;
+
+      double end_time = min_time_start + time_window;
+
+      std::map<int, std::pair<double, cv::Mat>> candidates;
+
+      double key_frame_time;
+      vector<double> key_frame_times;
+
+      // [DEBUG]
+      const char block = '#';
+      const double time_unit = 0.01; // 0.01초 = 공백 1칸
+
+      vector<double> fronts;
+      for (const auto &buf : m_img_time_buffers) {
+        if (!buf.empty()) {
+          fronts.push_back(buf.front());
+        } else {
+          fronts.push_back(numeric_limits<double>::max());
+        }
+      }
+      double min_time = *min_element(fronts.begin(), fronts.end());
+
+      for (size_t i = 0; i < m_img_time_buffers.size(); ++i) {
+        size_t size = m_img_time_buffers[i].size();
+        if (size == 0) {
+          cout << "Buffer " << i << ": (empty)" << endl;
+          continue;
+        }
+
+        double offset = fronts[i] - min_time;
+        int spaces = static_cast<int>(round(offset / time_unit));
+
+        cout << "Buffer " << i << ": ";
+        cout << string(spaces, ' ');
+        cout << string(size, block);
+        cout << " (" << size << ", offset: " << fixed << setprecision(6)
+             << offset << "s)" << endl;
+      }
+
+      int min_idx = -1;
+      for (int i = 0; i < num_of_cam; i++) {
+        if (m_img_time_buffers[i].empty()) {
+          std::cout << "channel pass(empty): " << i << std::endl;
+        }
+
+        double current_img_time = m_img_time_buffers[i].front();
+
+        if (current_img_time >= end_time) {
+          std::cout << std::fixed << std::setprecision(4)
+                    << "channel pass(over): " << i << " - " << current_img_time
+                    << std::endl;
+          continue;
+        }
+
+        double capture_time = current_img_time + exposure_time_init;
+        cv::Mat image = m_img_buffers[i].front();
+        candidates[i] = {capture_time, image};
+        key_frame_times.push_back(capture_time);
+        min_idx = min_idx == -1
+                      ? i
+                      : (m_img_time_buffers[min_idx].front() > current_img_time
+                             ? i
+                             : min_idx);
+      }
+
+      if (candidates.empty()) {
+        std::cout << "No Candidates" << std::endl;
+        return false;
+      } else if (candidates.size() < minimum_simultaneous_frame_num) {
+        std::cout << "Below minimum Candidates" << std::endl;
+        m_img_time_buffers[min_idx].pop_front();
+        m_img_buffers[min_idx].pop_front();
+        return false;
+      }
+
+      key_frame_time =
+          *std::max_element(key_frame_times.begin(), key_frame_times.end());
+
+      m_candidates = candidates;
+
+      std::cout << "candidates: " << candidates.size() << std::endl;
+
+      std::map<int, double> time_offsets_from_last_update;
+      for (const auto &cand : m_candidates) {
+        int cam_idx = cand.first;
+        double capture_time = cand.second.first;
+        // last_lio_update_time으로부터 각 이미지 캡처 시간까지의 시간 간격을
+        // 저장
+        time_offsets_from_last_update[cam_idx] =
+            capture_time - meas.last_lio_update_time;
+      }
+      vio_manager->setCameraTimeOffsets(time_offsets_from_last_update);
+
+      meas.measures.clear();
+
+      double lid_newest_time =
+          lid_header_time_buffer.back() +
+          lid_raw_data_buffer.back()->points.back().curvature / 1000.0;
+      double imu_newest_time = imu_buffer.back()->header.stamp.toSec();
+
+      if (key_frame_time > lid_newest_time) {
+        std::cout << std::fixed << std::setprecision(6)
+                  << "[sync false] lid < key_frame: " << lid_newest_time << "<"
+                  << key_frame_time << std::endl;
+        return false;
+      }
+
+      if (key_frame_time > imu_newest_time) {
+        std::cout << std::fixed << std::setprecision(6)
+                  << "[sync false] IMU < key_frame: " << imu_newest_time << "<"
+                  << key_frame_time << std::endl;
+        return false;
+      }
+
+      for (int i = 0; i < num_of_cam; i++) {
+        if (candidates.count(i)) {
+          m_img_time_buffers[i].pop_front();
+          m_img_buffers[i].pop_front();
+        }
+      }
+
+      if ((meas.pcl_proc_next->size() == 0 &&
+           key_frame_time < lid_header_time_buffer.front())) {
+        std::cout << "No pcl pending" << std::endl;
+        return false;
+      }
+
+      struct MeasureGroup m;
+
+      m.imu.clear();
+      m.lio_time = key_frame_time;
+      m.vio_time = key_frame_time;
+      mtx_buffer.lock();
+
+      while (!imu_buffer.empty() && imu_buffer.front()->header.stamp.toSec() <
+                                        meas.last_lio_update_time) {
+        imu_buffer.pop_front(); // 오래된 IMU 데이터 제거
+      }
+      while (!imu_buffer.empty() &&
+             imu_buffer.front()->header.stamp.toSec() <= key_frame_time) {
+        m.imu.push_back(imu_buffer.front());
+        imu_buffer.pop_front();
+      }
+      mtx_buffer.unlock();
+      sig_buffer.notify_all();
+
+      *(meas.pcl_proc_cur) = *(meas.pcl_proc_next);
+
+      PointCloudXYZI().swap(*meas.pcl_proc_next);
+
+      int lid_frame_num = lid_raw_data_buffer.size();
+      int max_size = meas.pcl_proc_cur->size() + 24000 * lid_frame_num;
+      meas.pcl_proc_cur->reserve(max_size);
+      meas.pcl_proc_next->reserve(max_size);
+
+      while (!lid_raw_data_buffer.empty()) {
+        if (lid_header_time_buffer.front() > key_frame_time)
+          break;
+        auto pcl(lid_raw_data_buffer.front()->points);
+        double frame_header_time(lid_header_time_buffer.front());
+
+        for (int i = 0; i < pcl.size(); i++) {
+          auto pt = pcl[i];
+          pt.curvature +=
+              (frame_header_time - meas.last_lio_update_time) * 1000.0f;
+          meas.pcl_proc_cur->points.push_back(pt);
+        }
+        lid_raw_data_buffer.pop_front();
+        lid_header_time_buffer.pop_front();
+      }
+
+      while (!meas.pcl_proc_cur->points.empty() &&
+             meas.pcl_proc_cur->points.back().curvature >
+                 (m.lio_time - meas.last_lio_update_time) * 1000.0f) {
+        auto pt = meas.pcl_proc_cur->points.back();
+        pt.curvature += (meas.last_lio_update_time - m.lio_time) * 1000.0f;
+        meas.pcl_proc_next->points.push_back(pt);
+        meas.pcl_proc_cur->points.pop_back();
+      }
+
+      std::reverse(meas.pcl_proc_next->points.begin(),
+                   meas.pcl_proc_next->points.end());
+
+      std::cout << std::fixed << std::setprecision(6)
+                << "[pcl_proc_cur Timestamp Range] min: "
+                << (double)meas.pcl_proc_cur->points.front().curvature /
+                           (double)1000.0 +
+                       meas.last_lio_update_time
+                << ", max: "
+                << (double)meas.pcl_proc_cur->points.back().curvature /
+                           (double)1000.0 +
+                       meas.last_lio_update_time
+                << std::endl;
+
+      std::cout << meas.pcl_proc_cur->points.back().curvature << " < "
+                << (m.lio_time - meas.last_lio_update_time) * 1000.0f
+                << std::endl;
+      assert(meas.pcl_proc_cur->points.back().curvature <=
+             (m.lio_time - meas.last_lio_update_time) * 1000.0f);
+
+      meas.measures.push_back(m);
+      meas.lio_vio_flg = LIO;
+
+      return true;
     }
+    case LIO: {
 
-    std::reverse(meas.pcl_proc_next->points.begin(),
-                 meas.pcl_proc_next->points.end());
+      meas.lio_vio_flg = VIO;
+      // printf("[ Data Cut ] VIO \n");
+      meas.measures.clear();
+      double imu_time = imu_buffer.front()->header.stamp.toSec();
 
-    std::cout << std::fixed << std::setprecision(6)
-              << "[pcl_proc_cur Timestamp Range] min: "
-              << (double)meas.pcl_proc_cur->points.front().curvature /
-                         (double)1000.0 +
-                     meas.last_lio_update_time
-              << ", max: "
-              << (double)meas.pcl_proc_cur->points.back().curvature /
-                         (double)1000.0 +
-                     meas.last_lio_update_time
-              << std::endl;
+      struct MeasureGroup m;
+      // m.lio_time = meas.last_lio_update_time;
+      m.vio_time = meas.last_lio_update_time;
+      m.vio_time = meas.last_lio_update_time;
 
-    std::cout << meas.pcl_proc_cur->points.back().curvature << " < "
-              << (m.lio_time - meas.last_lio_update_time) * 1000.0f
-              << std::endl;
-    assert(meas.pcl_proc_cur->points.back().curvature <=
-           (m.lio_time - meas.last_lio_update_time) * 1000.0f);
+      // std::cout << "candid num: " << m_candidates.size() << std::endl;
 
-    meas.measures.push_back(m);
-    meas.lio_vio_flg = LIO;
+      for (auto const &[cam_idx, val] : m_candidates) {
+        m.imgs.push_back(val.second); // cv::Mat
+        m.img_camera_indices.push_back(cam_idx);
+      }
 
-    return true;
+      // m.img = img_buffer.front();
+      mtx_buffer.lock();
+      // while ((!imu_buffer.empty() && (imu_time < img_capture_time)))
+      // {
+      //   imu_time = imu_buffer.front()->header.stamp.toSec();
+      //   if (imu_time > img_capture_time) break;
+      //   m.imu.push_back(imu_buffer.front());
+      //   imu_buffer.pop_front();
+      //   printf("[ Data Cut ] imu time: %lf \n",
+      //   imu_buffer.front()->header.stamp.toSec());
+      // }
+      mtx_buffer.unlock();
+      sig_buffer.notify_all();
+      meas.measures.push_back(m);
+      lidar_pushed = false;
+      // after VIO update, the _lidar_frame_end_time will be refresh.
+      // printf("[ Data Cut ] VIO process time: %lf \n", omp_get_wtime() - t0);
+      return true;
+    }
+    default: {
+      // printf("!! WRONG EKF STATE !!");
+      return false;
+    }
+    }
+    // return false;
+    break;
   }
-  case LIO: {
 
-    meas.lio_vio_flg = VIO;
-    // printf("[ Data Cut ] VIO \n");
-    meas.measures.clear();
-    double imu_time = imu_buffer.front()->header.stamp.toSec();
-
-    struct MeasureGroup m;
-    // m.lio_time = meas.last_lio_update_time;
-    m.vio_time = meas.last_lio_update_time;
-    m.vio_time = meas.last_lio_update_time;
-
-    // std::cout << "candid num: " << m_candidates.size() << std::endl;
-
-    for (auto const &[cam_idx, val] : m_candidates) {
-      m.imgs.push_back(val.second); // cv::Mat
-      m.img_camera_indices.push_back(cam_idx);
+  case ONLY_LO: {
+    if (!lidar_pushed) {
+      // If not in lidar scan, need to generate new meas
+      if (lid_raw_data_buffer.empty())
+        return false;
+      meas.lidar = lid_raw_data_buffer.front(); // push the first lidar
+      meas.lidar_frame_beg_time =
+          lid_header_time_buffer.front(); // generate lidar_beg_time
+      meas.lidar_frame_end_time =
+          meas.lidar_frame_beg_time +
+          meas.lidar->points.back().curvature / double(1000);
+      lidar_pushed = true;
     }
-
-    // m.img = img_buffer.front();
+    struct MeasureGroup m; // standard method to keep imu message.
+    m.lio_time = meas.lidar_frame_end_time;
     mtx_buffer.lock();
-    // while ((!imu_buffer.empty() && (imu_time < img_capture_time)))
-    // {
-    //   imu_time = imu_buffer.front()->header.stamp.toSec();
-    //   if (imu_time > img_capture_time) break;
-    //   m.imu.push_back(imu_buffer.front());
-    //   imu_buffer.pop_front();
-    //   printf("[ Data Cut ] imu time: %lf \n",
-    //   imu_buffer.front()->header.stamp.toSec());
-    // }
+    lid_raw_data_buffer.pop_front();
+    lid_header_time_buffer.pop_front();
     mtx_buffer.unlock();
     sig_buffer.notify_all();
+    lidar_pushed = false; // sync one whole lidar scan.
+    meas.lio_vio_flg = LO;
+    // process lidar topic, so timestamp should be lidar scan end.
     meas.measures.push_back(m);
-    lidar_pushed = false;
-    // after VIO update, the _lidar_frame_end_time will be refresh.
-    // printf("[ Data Cut ] VIO process time: %lf \n", omp_get_wtime() - t0);
     return true;
+    break;
+  }
+
+  default: {
+    printf("!! WRONG SLAM TYPE !!");
+    return false;
   }
   }
-  return true;
+  ROS_ERROR("out sync");
 }
 
 void LIVMapper::publish_img_rgb(const image_transport::Publisher &pubImage,
-                                VIOManagerPtr vio_manager) {
-  cv::Mat img_rgb = vio_manager->img_cp;
+                                VIOManagerPtr vio_manager, int cam_idx) {
+  cv::Mat img_rgb = vio_manager->img_cps[cam_idx];
   cv_bridge::CvImage out_msg;
   out_msg.header.stamp = ros::Time::now();
   // out_msg.header.frame_id = "camera_init";
@@ -1666,7 +1500,7 @@ void LIVMapper::publish_img_rgb(const image_transport::Publisher &pubImage,
 
 void LIVMapper::publish_frame_world(bool publish_frame,
                                     const ros::Publisher &pubLaserCloudFullRes,
-                                    VIOManagerPtr vio_manager) {
+                                    VIOManagerPtr vio_manager, int cam_idx) {
   if (pcl_w_wait_pub->empty())
     return;
   PointCloudXYZRGB::Ptr laserCloudWorldRGB(new PointCloudXYZRGB());
@@ -1675,7 +1509,7 @@ void LIVMapper::publish_frame_world(bool publish_frame,
       size_t size = pcl_wait_pub->points.size();
       laserCloudWorldRGB->reserve(size);
       // double inv_expo = _state.inv_expo_time;
-      cv::Mat img_rgb = vio_manager->img_rgb;
+      cv::Mat img_rgb = vio_manager->img_rgbs[cam_idx];
       for (size_t i = 0; i < size; i++) {
         PointTypeRGB pointRGB;
         pointRGB.x = pcl_wait_pub->points[i].x;
@@ -1692,24 +1526,24 @@ void LIVMapper::publish_frame_world(bool publish_frame,
 
         V2D pc(vio_manager->new_frame_->w2c(p_w));
 
-        if (vio_manager->new_frame_->cam_->isInFrame(pc.cast<int>(), 3)) // 100
+        if (vio_manager->new_frame_->cam_->isInFrame(pc.cast<int>(),
+                                                     3)) // 100
         {
           V3F pixel = vio_manager->getInterpolatedPixel(img_rgb, pc);
           pointRGB.r = pixel[2];
           pointRGB.g = pixel[1];
           pointRGB.b = pixel[0];
-          // pointRGB.r = pixel[2] * inv_expo; pointRGB.g = pixel[1] * inv_expo;
-          // pointRGB.b = pixel[0] * inv_expo; if (pointRGB.r > 255) pointRGB.r
-          // = 255; else if (pointRGB.r < 0) pointRGB.r = 0; if (pointRGB.g >
-          // 255) pointRGB.g = 255; else if (pointRGB.g < 0) pointRGB.g = 0; if
-          // (pointRGB.b > 255) pointRGB.b = 255; else if (pointRGB.b < 0)
-          // pointRGB.b = 0;
+          // pointRGB.r = pixel[2] * inv_expo; pointRGB.g = pixel[1] *
+          // inv_expo; pointRGB.b = pixel[0] * inv_expo; if (pointRGB.r > 255)
+          // pointRGB.r = 255; else if (pointRGB.r < 0) pointRGB.r = 0; if
+          // (pointRGB.g > 255) pointRGB.g = 255; else if (pointRGB.g < 0)
+          // pointRGB.g = 0; if (pointRGB.b > 255) pointRGB.b = 255; else if
+          // (pointRGB.b < 0) pointRGB.b = 0;
           if (pf.norm() > blind_rgb_points)
             laserCloudWorldRGB->push_back(pointRGB);
         }
       }
-      std::cout << "[CLOUD_REGISTERED] cam_idx: " << vio_manager->cam_idx
-                << std::endl;
+      std::cout << "[CLOUD_REGISTERED] cam_idx: " << cam_idx << std::endl;
     }
   }
 
@@ -1855,91 +1689,62 @@ void LIVMapper::publish_mavros(const ros::Publisher &mavros_pose_publisher) {
 
 void LIVMapper::publish_path(const ros::Publisher pubPath) {
   set_posestamp(msg_body_pose.pose);
-  msg_body_pose.header.stamp = ros::Time::now();
+  msg_body_pose.header.stamp = ros::Time(LidarMeasures.last_lio_update_time);
   msg_body_pose.header.frame_id = "camera_init";
   path.poses.push_back(msg_body_pose);
   pubPath.publish(path);
 }
 
-void LIVMapper::save_path_to_file() {
+void LIVMapper::save_path_to_file(const std::string &file_path) {
   if (path.poses.empty()) {
-    ROS_WARN("Path is empty. Nothing to save.");
+    ROS_WARN_ONCE("Path is empty. Nothing to write yet.");
     return;
   }
 
-  // --- 1. TUM Trajectory Format 파일 저장 ---
-  // 프로젝트 Log 폴더에 저장될 경로를 생성합니다.
-  // ROOT_DIR은 CMakeLists.txt에 정의되어 있어야 합니다.
-  std::string tum_output_path =
-      std::string(ROOT_DIR) + "/Log/final_trajectory_tum.txt";
-  std::ofstream tum_file(tum_output_path);
+  static bool is_file_initialized = false;
 
-  if (!tum_file.is_open()) {
-    ROS_ERROR("Failed to open file to save TUM trajectory: %s",
-              tum_output_path.c_str());
-  } else {
+  // --- 1. TUM Trajectory Format 파일 저장 ---
+  const std::string &tum_output_path = file_path;
+
+  // 파일 스트림 객체
+  std::ofstream tum_file;
+
+  if (!is_file_initialized) {
+    tum_file.open(tum_output_path, std::ios::out);
+    if (!tum_file.is_open()) {
+      ROS_ERROR(
+          "Failed to open file to save TUM trajectory for the first time: %s",
+          tum_output_path.c_str());
+      return;
+    }
     // 파일 헤더 주석 (TUM 포맷 표준)
     tum_file << "# timestamp tx ty tz qx qy qz qw" << std::endl;
-
-    // 모든 pose 데이터를 순회하며 TUM 포맷으로 저장
-    for (const auto &pose_stamped : path.poses) {
-      tum_file << std::fixed << std::setprecision(6) // 소수점 6자리로 고정
-               << pose_stamped.header.stamp.toSec() << " "
-               << pose_stamped.pose.position.x << " "
-               << pose_stamped.pose.position.y << " "
-               << pose_stamped.pose.position.z << " "
-               << pose_stamped.pose.orientation.x << " "
-               << pose_stamped.pose.orientation.y << " "
-               << pose_stamped.pose.orientation.z << " "
-               << pose_stamped.pose.orientation.w << std::endl;
-    }
-    tum_file.close();
-    ROS_INFO("Successfully saved TUM trajectory to %s",
-             tum_output_path.c_str());
-  }
-
-  // --- 2. Gnuplot을 이용한 2D 경로(XY-plane projected path) 이미지 저장 ---
-  std::vector<double> x_coords, y_coords;
-  for (const auto &pose_stamped : path.poses) {
-    x_coords.push_back(pose_stamped.pose.position.x);
-    y_coords.push_back(pose_stamped.pose.position.y);
-  }
-
-  // gnuplot 프로세스를 파이프로 엽니다.
-  FILE *gnuplotPipe = popen("gnuplot", "w");
-  if (gnuplotPipe) {
-    // gnuplot 명령어 전송
-    fprintf(gnuplotPipe, "set title 'Robot Trajectory'\n");
-    fprintf(gnuplotPipe,
-            "set xlabel 'X coordinate (m)'\n"); // 오타 수정: gnuploset ->
-                                                // fprintf(gnuplotPipe, "set
-    fprintf(gnuplotPipe, "set ylabel 'Y coordinate (m)'\n");
-    fprintf(gnuplotPipe, "set grid\n");
-    fprintf(gnuplotPipe, "set size ratio -1\n"); // 축 비율을 1:1로 설정
-
-    // PNG 파일로 출력 설정 (프로젝트 Log 폴더에 저장)
-    std::string png_output_path =
-        std::string(ROOT_DIR) + "/Log/final_trajectory_gnuplot.png";
-    fprintf(gnuplotPipe, "set terminal pngcairo size 800,800\n");
-    fprintf(gnuplotPipe, "set output '%s'\n", png_output_path.c_str());
-
-    // 데이터와 함께 플롯 명령어 전송. '-'는 표준 입력을 의미합니다.
-    fprintf(gnuplotPipe, "plot '-' with lines title 'Path'\n");
-
-    // 데이터 포인트를 gnuplot에 전송
-    for (size_t i = 0; i < x_coords.size(); ++i) {
-      fprintf(gnuplotPipe, "%f %f\n", x_coords[i], y_coords[i]);
-    }
-
-    // 데이터 전송 끝을 알리는 'e' (end of data)
-    fprintf(gnuplotPipe, "e\n");
-
-    // 버퍼를 비우고 파이프를 닫아 파일 저장을 완료합니다.
-    fflush(gnuplotPipe);
-    pclose(gnuplotPipe);
-
-    ROS_INFO("Successfully saved plot to %s", png_output_path.c_str());
+    is_file_initialized = true;
   } else {
-    ROS_ERROR("Could not open gnuplot pipe. Is gnuplot installed?");
+    // 두 번째 호출부터: 기존 파일 끝에 데이터를 추가(append)
+    tum_file.open(tum_output_path, std::ios::app);
+    if (!tum_file.is_open()) {
+      ROS_ERROR("Failed to open file to append TUM trajectory: %s",
+                tum_output_path.c_str());
+      return;
+    }
   }
+
+  const auto &last_pose_stamped = path.poses.back();
+
+  tum_file << std::fixed << std::setprecision(6)
+           << last_pose_stamped.header.stamp.toSec() << " "
+           << last_pose_stamped.pose.position.x << " "
+           << last_pose_stamped.pose.position.y << " "
+           << last_pose_stamped.pose.position.z << " "
+           << last_pose_stamped.pose.orientation.x << " "
+           << last_pose_stamped.pose.orientation.y << " "
+           << last_pose_stamped.pose.orientation.z << " "
+           << last_pose_stamped.pose.orientation.w << std::endl;
+
+  tum_file.close();
+
+  // ROS_INFO는 너무 자주 출력되므로 주석 처리하거나 ROS_INFO_THROTTLE 사용을
+  // 권장 ROS_INFO("Successfully appended trajectory to %s",
+  // tum_output_path.c_str());
 }

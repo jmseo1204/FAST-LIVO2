@@ -81,6 +81,8 @@ public:
 
 class VIOManager {
 public:
+  std::vector<Frame *> new_frame_vec;
+  std::vector<SubSparseMap *> visual_submaps;
   std::vector<vk::AbstractCamera *> m_cameras;
   std::vector<M3D> m_R_c_i_vec;
   std::vector<V3D> m_P_c_i_vec;
@@ -88,14 +90,32 @@ public:
   std::vector<V3D> m_P_c_l_vec;
   M3D Rli, Rci, Rcl, Rcw, Jdphi_dR, Jdp_dt, Jdp_dR;
   V3D Pli, Pci, Pcl, Pcw;
-  int cam_idx;
+  // int cam_idx;
+
   vector<unordered_map<VOXEL_LOCATION, int> *> sub_feat_maps;
 
   std::vector<double> m_img_time_offsets_from_last_update;
 
-  M3D original_Rci, original_Rcl;
-  V3D original_Pci, original_Pcl;
-  M3D original_Jdphi_dR, original_Jdp_dR;
+  std::vector<M3D> original_Rci_vec, original_Rcl_vec;
+  std::vector<V3D> original_Pci_vec, original_Pcl_vec;
+  // M3D original_Jdphi_dR, original_Jdp_dR;
+
+  void processMultiCamVIO(
+      const std::vector<cv::Mat> &imgs, const std::vector<int> &cam_indices,
+      const std::vector<Pose6D> &imu_poses, multimap<double, pointWithVar> &pg,
+      const unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &feat_map,
+      double img_time,
+      bool en_cam_backprop // 백프로파게이션 활성화 여부를 인자로 받음
+  );
+
+  void computeJacobianAndUpdateEKF(const std::vector<cv::Mat> &imgs,
+                                   const std::vector<int> &cam_indices,
+                                   const std::vector<Pose6D> &imu_poses,
+                                   bool en_cam_backprop);
+
+  void buildJacobianAndResiduals(const cv::Mat &img,
+                                 SubSparseMap *current_cam_submap, int level,
+                                 VectorXd &z_cam, MatrixXd &H_sub_cam);
 
   void setCameraTimeOffsets(const std::map<int, double> &time_offsets);
   void compensateExtrinsicsByTimeOffset(const std::vector<Pose6D> &imu_poses,
@@ -158,8 +178,9 @@ public:
   unordered_map<int, Warp *> warp_map;
   vector<VisualPoint *> retrieve_voxel_points;
   vector<pointWithVar> append_voxel_points;
-  FramePtr new_frame_;
+  Frame *new_frame_;
   cv::Mat img_cp, img_rgb, img_test;
+  vector<cv::Mat> img_cps, img_rgbs, img_tests;
 
   enum CellType { TYPE_MAP = 1, TYPE_POINTCLOUD, TYPE_UNKNOWN };
 
@@ -182,13 +203,14 @@ public:
                double img_time);
   void retrieveFromVisualSparseMap(
       cv::Mat img, multimap<double, pointWithVar> &pg,
-      const unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &plane_map);
+      const unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &plane_map,
+      int cam_idx);
   void generateVisualMapPoints(cv::Mat img, multimap<double, pointWithVar> &pg);
   void setImuToLidarExtrinsic(const V3D &transl, const M3D &rot);
   void initializeVIO();
   void getImagePatch(cv::Mat img, V2D pc, float *patch_tmp, int level);
   void computeProjectionJacobian(V3D p, MD(2, 3) & J);
-  void computeJacobianAndUpdateEKF(cv::Mat img);
+  // void computeJacobianAndUpdateEKF(cv::Mat img);
   void resetGrid();
   void updateVisualMapPoints(cv::Mat img);
   void getWarpMatrixAffine(const vk::AbstractCamera &cam,
@@ -206,7 +228,7 @@ public:
                   const int search_level, const int pyramid_level,
                   const int halfpatch_size, float *patch);
   void insertPointIntoVoxelMap(VisualPoint *pt_new);
-  void plotTrackedPoints();
+  void plotTrackedPoints(int cam_idx);
   void updateFrameState(StatesGroup state);
   void projectPatchFromRefToCur(
       const unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &plane_map);
