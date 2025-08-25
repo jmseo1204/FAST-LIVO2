@@ -361,7 +361,7 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat,
     body_cov_list_.push_back(var);
     point_this = extR_ * point_this + extT_;
     M3D point_crossmat;
-    point_crossmat << SKEW_SYM_MATRX(point_this);
+    point_crossmat << SKEW_SYM_MATRX(state_.rot_end * point_this);
     cross_mat_list_.push_back(point_crossmat);
   }
 
@@ -396,8 +396,9 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat,
 
       M3D cov = body_cov_list_[i];
       M3D point_crossmat = cross_mat_list_[i];
-      cov = state_.rot_end * cov * state_.rot_end.transpose() +
-            (-point_crossmat) * rot_var * (-point_crossmat.transpose()) + t_var;
+      cov =
+          state_.rot_end * extR_ * cov * (state_.rot_end * extR_).transpose() +
+          (-point_crossmat) * rot_var * (-point_crossmat.transpose()) + t_var;
       pv.var = cov;
       pv.body_var = body_cov_list_[i];
     }
