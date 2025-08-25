@@ -43,8 +43,7 @@ float VIOManager::computeMultiScaleScore(
       float score_at_level =
           vk::shiTomasiScore(current_img, pc_level.x(), pc_level.y());
 
-      // 첫 번째 루프와 두 번째 루프에서 가중치 계산 방식이 다름
-      double huristic_reference_depth = 2.0;
+      double huristic_reference_depth = 3.0;
       float weight =
           std::pow(huristic_reference_depth / depth, level) /
           ((std::pow(huristic_reference_depth / depth, PYRAMID_LEVELS) - 1) /
@@ -811,6 +810,9 @@ void VIOManager::retrieveFromVisualSparseMap(
         V3D dir(new_frame_->T_f_w_ * pt->pos_);
         if (dir[2] < 0)
           continue;
+
+        if (dir[2] > max_depth_threshold || dir[2] < min_depth_threshold)
+          continue;
         // dir.normalize();
         // if (dir.dot(norm_vec) <= 0.17) continue; // 0.34 70 degree  0.17 80
         // degree 0.08 85 degree
@@ -1187,7 +1189,7 @@ void VIOManager::generateVisualMapPoints(cv::Mat img,
     gray_img = img.clone();
   }
 
-  const int PYRAMID_LEVELS = 3;
+  const int PYRAMID_LEVELS = 1;
   std::vector<cv::Mat> pyramid_images;
   pyramid_images.push_back(gray_img);
   for (int i = 1; i < PYRAMID_LEVELS; ++i) {
@@ -2015,6 +2017,7 @@ void VIOManager::processMultiCamVIO(
       cv::resize(current_img, current_img, cv::Size(width, height), 0, 0,
                  CV_INTER_LINEAR);
     }
+
     img_cps[cam_idx] = current_img.clone();
     img_rgbs[cam_idx] = current_img.clone();
 

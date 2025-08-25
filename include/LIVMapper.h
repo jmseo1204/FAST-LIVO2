@@ -90,6 +90,7 @@ public:
   StatesGroup last_IMU_state;
   ros::Publisher pubImuPredictedOdom;
   bool show_imu_path = false;
+  bool only_side_cam = false;
 
   SLAM_MODE slam_mode_;
   std::unordered_map<VOXEL_LOCATION, VoxelOctoTree *> voxel_map;

@@ -1,6 +1,6 @@
 cam_3:
   cam_model: EquidistantCamera
-  cam_width: 2448        
+  cam_width: 2448     
   cam_height: 2048       
   scale: 0.25
   cam_fx: 786.5142416076859

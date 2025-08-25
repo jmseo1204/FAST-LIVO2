@@ -1,7 +1,7 @@
 cam_1:
   cam_model: EquidistantCamera
-  cam_width: 2448        
-  cam_height: 2048       
+  cam_width: 2448     
+  cam_height: 2048      
   scale: 0.25
   cam_fx: 779.3398118909239
   cam_fy: 776.3943622977735

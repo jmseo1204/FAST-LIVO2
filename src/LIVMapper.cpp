@@ -51,6 +51,7 @@ LIVMapper::~LIVMapper() {}
 
 void LIVMapper::readParameters(ros::NodeHandle &nh) {
 
+  nh.param<bool>("common/only_side_cam", only_side_cam, false);
   nh.param<bool>("common/en_cam_backprop", en_cam_backprop, false);
   nh.param<double>("common/lidar_window_size", lidar_window_size, 0.1);
   nh.param<int>("common/minimum_simultaneous_frame_num",
@@ -594,30 +595,31 @@ void LIVMapper::handleLIO() {
     voxelmap_manager->mapSliding();
   }
 
-  // PointCloudXYZI::Ptr laserCloudFullRes(dense_map_en ? feats_undistort
-  //                                                    : feats_down_body);
-  // int size = laserCloudFullRes->points.size();
-  // PointCloudXYZI::Ptr laserCloudWorld(new PointCloudXYZI(size, 1));
-
-  // for (int i = 0; i < size; i++) {
-  //   RGBpointBodyToWorld(&laserCloudFullRes->points[i],
-  //                       &laserCloudWorld->points[i]);
-  // }
-
   PointCloudXYZI::Ptr laserCloudWorld(new PointCloudXYZI());
-  laserCloudWorld->reserve(_pv_prev.size());
+
+  if (dense_map_en) {
+    PointCloudXYZI::Ptr laserCloudFullRes(feats_undistort);
+    int size = laserCloudFullRes->points.size();
+    laserCloudWorld = PointCloudXYZI::Ptr(new PointCloudXYZI(size, 1));
+    for (int i = 0; i < size; i++) {
+      RGBpointBodyToWorld(&laserCloudFullRes->points[i],
+                          &laserCloudWorld->points[i]);
+    }
+
+  } else {
+    for (const auto &pair : _pv_prev) {
+      const auto &pv = pair.second;
+      PointType point;
+      point.x = pv.point_w(0);
+      point.y = pv.point_w(1);
+      point.z = pv.point_w(2);
+      // point.intensity = pv.intensity;
+      // point.curvature = pv.timestamp;
+      laserCloudWorld->points.push_back(point);
+    }
+  }
 
   // std::cout << "handleLIO _pv_prev size: " << _pv_prev.size() << std::endl;
-  for (const auto &pair : _pv_prev) {
-    const auto &pv = pair.second;
-    PointType point;
-    point.x = pv.point_w(0);
-    point.y = pv.point_w(1);
-    point.z = pv.point_w(2);
-    // point.intensity = pv.intensity;
-    // point.curvature = pv.timestamp;
-    laserCloudWorld->points.push_back(point);
-  }
 
   *pcl_w_wait_pub = *laserCloudWorld;
 
@@ -1173,6 +1175,11 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas) {
   case LIVO: {
     double min_time_start = std::numeric_limits<double>::max();
     for (int i = 0; i < m_img_buffers.size(); i++) {
+      // DEBUG
+      if (only_side_cam && (i == 0 || i == 2)) {
+        continue;
+      }
+
       while (!m_img_time_buffers[i].empty() &&
              m_img_time_buffers[i].front() <
                  meas.last_lio_update_time + 0.00001) {
@@ -1240,6 +1247,12 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas) {
 
       int min_idx = -1;
       for (int i = 0; i < num_of_cam; i++) {
+
+        // DEBUG
+        if (only_side_cam && (i == 0 || i == 2)) {
+          continue;
+        }
+
         if (m_img_time_buffers[i].empty()) {
           std::cout << "channel pass(empty): " << i << std::endl;
         }
