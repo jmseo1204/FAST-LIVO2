@@ -22,6 +22,7 @@ void VIOManager::readParameters(ros::NodeHandle &nh) {
                   150.0);
   nh.param<float>("vio/min_depth_threshold", min_depth_threshold, 1.5);
   nh.param<float>("vio/max_depth_threshold", max_depth_threshold, 10.0);
+  nh.param<int>("vio/min_visual_points", min_visual_points, 20);
 
   ROS_INFO("VIO Parameters loaded - shiTomasiScore_threshold: %.1f, "
            "min_depth_threshold: %.1f, max_depth_threshold: %.1f",
@@ -571,6 +572,12 @@ void VIOManager::computeJacobianAndUpdateEKF(
   compute_jacobian_time = 0.0;
   update_ekf_time = 0.0;
 
+  // 통계 수집 준비: 레벨별 total_rows 평균 계산용 누적기
+  std::vector<double> level_sum_total_rows(
+      static_cast<size_t>(patch_pyrimid_level), 0.0);
+  std::vector<int> level_iteration_counts(
+      static_cast<size_t>(patch_pyrimid_level), 0);
+
   // 패치 피라미드 레벨에 대한 Coarse-to-Fine 루프
   for (int level = patch_pyrimid_level - 1; level >= 0; level--) {
 
@@ -578,7 +585,6 @@ void VIOManager::computeJacobianAndUpdateEKF(
     bool EKF_end = false;
     float last_error = std::numeric_limits<float>::max();
 
-    // IEKF 반복 최적화 루프
     for (int iteration = 0; iteration < max_iterations; iteration++) {
       double t1_jacobian = omp_get_wtime();
 
@@ -607,14 +613,23 @@ void VIOManager::computeJacobianAndUpdateEKF(
         }
       }
 
-      if (total_rows == 0) {
+      // int min_visual_points = 20;
+
+      if (total_rows / patch_size_total < min_visual_points) {
         if (iteration == 0)
           total_points = 0; // 첫 반복에 포인트가 없으면 0으로 설정
         EKF_end = true;
         break;
       }
+
       if (iteration == 0)
         total_points = total_rows / patch_size_total;
+
+      // 레벨별 누적 (레벨 인덱스는 0..patch_pyrimid_level-1과 일치시키기 위해
+      // level 자체 사용)
+      level_sum_total_rows[static_cast<size_t>(level)] +=
+          static_cast<double>(total_rows);
+      level_iteration_counts[static_cast<size_t>(level)] += 1;
 
       // 2. 모든 H와 z를 하나의 큰 행렬/벡터로 결합 (Stacking)
       MatrixXd H_all(total_rows, 7);
@@ -671,6 +686,18 @@ void VIOManager::computeJacobianAndUpdateEKF(
     }
   }
 
+  // 레벨별 평균을 멤버에 기록 (프레임 단위)
+  level_avg_visual_points.clear();
+  level_avg_visual_points.resize(static_cast<size_t>(patch_pyrimid_level), 0.0);
+  for (int l = 0; l < patch_pyrimid_level; ++l) {
+    int cnt = level_iteration_counts[static_cast<size_t>(l)];
+    level_avg_visual_points[static_cast<size_t>(l)] =
+        (cnt > 0) ? (level_sum_total_rows[static_cast<size_t>(l)] /
+                     static_cast<double>(cnt)) /
+                        patch_size_total
+                  : 0.0;
+  }
+
   // 최종 공분산 업데이트 및 상태 반영
   state->cov -= G * state->cov;
 }
@@ -705,6 +732,7 @@ void VIOManager::retrieveFromVisualSparseMap(
   // downSizeFilter.filter(*pg_down);
 
   // resetRvizDisplay();
+  visual_submap = visual_submaps[cam_idx];
   visual_submap->reset();
 
   // Controls whether to include the visual submap from the previous frame.
@@ -1007,6 +1035,8 @@ void VIOManager::retrieveFromVisualSparseMap(
         continue;
 
       if (normal_en) {
+
+        // update ref patch among target(obs_) patches
         float phtometric_errors_min = std::numeric_limits<float>::max();
 
         if (pt->obs_.size() == 1) {
@@ -2035,7 +2065,6 @@ void VIOManager::processMultiCamVIO(
 
     resetGrid();
 
-    // 현재 카메라로 관측되는 특징점들을 찾아 멤버 변수 visual_submap에 저장
     retrieveFromVisualSparseMap(current_img, pg, feat_map, cam_idx);
 
     processed_imgs.push_back(current_img);
@@ -2043,7 +2072,6 @@ void VIOManager::processMultiCamVIO(
 
   t2 = omp_get_wtime();
 
-  // 2. 통합 최적화 수행
   computeJacobianAndUpdateEKF(processed_imgs, cam_indices, imu_poses,
                               en_cam_backprop);
 

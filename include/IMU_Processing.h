@@ -86,7 +86,7 @@ private:
   V3D acc_s_last;
   double last_prop_end_time;
   double time_last_scan;
-  int init_iter_num = 1, MAX_INI_COUNT = 20;
+  int init_iter_num = 1, MAX_INI_COUNT = 100;
   bool b_first_frame = true;
   bool imu_en = true;
   bool gravity_est_en = true;

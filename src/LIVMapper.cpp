@@ -11,6 +11,7 @@ which is included as part of this source code package.
 */
 
 #include "LIVMapper.h"
+#include <Eigen/Eigenvalues>
 
 LIVMapper::LIVMapper(ros::NodeHandle &nh)
     : extT(0, 0, 0), extR(M3D::Identity()) {
@@ -52,6 +53,7 @@ LIVMapper::~LIVMapper() {}
 void LIVMapper::readParameters(ros::NodeHandle &nh) {
 
   nh.param<bool>("common/only_side_cam", only_side_cam, false);
+  nh.param<bool>("common/mapping_after_vio", mapping_after_vio, false);
   nh.param<bool>("common/en_cam_backprop", en_cam_backprop, false);
   nh.param<double>("common/lidar_window_size", lidar_window_size, 0.1);
   nh.param<int>("common/minimum_simultaneous_frame_num",
@@ -372,15 +374,15 @@ void LIVMapper::handleVIO() {
 
   auto &m = LidarMeasures.measures.back();
 
-  if (m.imgs.empty() || pcl_w_wait_pub->empty() ||
-      (pcl_w_wait_pub == nullptr)) {
+  if (m.imgs.empty()) {
     return;
   }
 
-  const auto &imu_poses = p_imu->IMUpose_cp;
+  // if (pcl_w_wait_pub->empty() || (pcl_w_wait_pub == nullptr)) {
+  //   return;
+  // }
 
-  std::cout << "[ VIO ] Raw feature num: " << pcl_w_wait_pub->points.size()
-            << std::endl;
+  const auto &imu_poses = p_imu->IMUpose_cp;
 
   if (fabs((LidarMeasures.last_lio_update_time - _first_lidar_time) -
            plot_time) < (frame_cnt / 2 * 0.1)) {
@@ -389,6 +391,85 @@ void LIVMapper::handleVIO() {
     vio_manager->plot_flag = false;
   }
 
+  // Snapshot covariances before VIO
+  Eigen::Matrix3d rot_cov_pre = _state.cov.block<3, 3>(0, 0);
+  Eigen::Matrix3d trans_cov_pre = _state.cov.block<3, 3>(3, 3);
+
+  vio_manager->processMultiCamVIO(
+      m.imgs, m.img_camera_indices, imu_poses, _pv_prev,
+      voxelmap_manager->voxel_map_,
+      LidarMeasures.last_lio_update_time - _first_lidar_time, en_cam_backprop);
+
+  // Write VIO stats
+  Eigen::Matrix3d rot_cov_post = _state.cov.block<3, 3>(0, 0);
+  Eigen::Matrix3d trans_cov_post = _state.cov.block<3, 3>(3, 3);
+  writeVIOStats(LidarMeasures.last_lio_update_time, rot_cov_pre, trans_cov_pre,
+                rot_cov_post, trans_cov_post, num_of_cam, m.img_camera_indices);
+
+  if (mapping_after_vio) {
+    PointCloudXYZI::Ptr world_lidar(new PointCloudXYZI());
+    transformLidar(_state.rot_end, _state.pos_end, feats_down_body,
+                   world_lidar);
+    for (size_t i = 0; i < world_lidar->points.size(); i++) {
+      voxelmap_manager->pv_list_[i].point_w << world_lidar->points[i].x,
+          world_lidar->points[i].y, world_lidar->points[i].z;
+      M3D point_crossmat = voxelmap_manager->cross_mat_list_[i];
+      M3D var = voxelmap_manager->body_cov_list_[i];
+      var =
+          (_state.rot_end * extR) * var * (_state.rot_end * extR).transpose() +
+          (-point_crossmat) * _state.cov.block<3, 3>(0, 0) *
+              (-point_crossmat).transpose() +
+          _state.cov.block<3, 3>(3, 3);
+      voxelmap_manager->pv_list_[i].var = var;
+    }
+
+    voxelmap_manager->UpdateVoxelMap(voxelmap_manager->pv_list_);
+    std::cout << "[ AFTER VIO ] Update Voxel Map" << std::endl;
+
+    _pv_list = voxelmap_manager->pv_list_;
+
+    for (const auto &point : _pv_list) {
+      auto it = _pv_prev.find(point.timestamp);
+      if (it == _pv_prev.end()) {
+        continue;
+      } else {
+        auto &pv = it->second;
+        pv.point_w << point.point_w(0), point.point_w(1), point.point_w(2);
+        pv.var = point.var;
+      }
+    }
+
+    PointCloudXYZI::Ptr laserCloudWorld(new PointCloudXYZI());
+
+    if (dense_map_en) {
+      PointCloudXYZI::Ptr laserCloudFullRes(feats_undistort);
+      int size = laserCloudFullRes->points.size();
+      laserCloudWorld = PointCloudXYZI::Ptr(new PointCloudXYZI(size, 1));
+      for (int i = 0; i < size; i++) {
+        RGBpointBodyToWorld(&laserCloudFullRes->points[i],
+                            &laserCloudWorld->points[i]);
+      }
+
+    } else {
+      for (const auto &pair : _pv_prev) {
+        const auto &pv = pair.second;
+        PointType point;
+        point.x = pv.point_w(0);
+        point.y = pv.point_w(1);
+        point.z = pv.point_w(2);
+        // point.intensity = pv.intensity;
+        // point.curvature = pv.timestamp;
+        laserCloudWorld->points.push_back(point);
+      }
+    }
+
+    // std::cout << "handleLIO _pv_prev size: " << _pv_prev.size() << std::endl;
+
+    *pcl_w_wait_pub = *laserCloudWorld;
+  }
+
+  std::cout << "[ VIO ] Raw feature num: " << pcl_w_wait_pub->points.size()
+            << std::endl;
   *pcl_wait_pub += *pcl_w_wait_pub;
   bool publish_frame = false;
   if (pub_num == pub_scan_num) {
@@ -397,11 +478,6 @@ void LIVMapper::handleVIO() {
   } else {
     pub_num++;
   }
-
-  vio_manager->processMultiCamVIO(
-      m.imgs, m.img_camera_indices, imu_poses, _pv_prev,
-      voxelmap_manager->voxel_map_,
-      LidarMeasures.last_lio_update_time - _first_lidar_time, en_cam_backprop);
 
   for (size_t i = 0; i < m.img_camera_indices.size(); ++i) {
     int cam_idx = m.img_camera_indices[i];
@@ -430,6 +506,79 @@ void LIVMapper::handleVIO() {
            << _state.bias_g.transpose() << " " << _state.bias_a.transpose()
            << " " << V3D(_state.inv_expo_time, 0, 0).transpose() << " "
            << feats_undistort->points.size() << std::endl;
+}
+
+void LIVMapper::writeVIOStats(double cur_time,
+                              const Eigen::Matrix3d &rot_cov_pre,
+                              const Eigen::Matrix3d &trans_cov_pre,
+                              const Eigen::Matrix3d &rot_cov_post,
+                              const Eigen::Matrix3d &trans_cov_post,
+                              int total_cam_count,
+                              const std::vector<int> &used_cam_indices) {
+  // Prepare VIO stats file (open once and write header)
+  if (!fout_vio_stats.is_open()) {
+    std::string path =
+        vio_stats_path.empty()
+            ? std::string("/mnt/c/Users/USER/Desktop/fast_livo2/results/") +
+                  "vio_stats.txt"
+            : vio_stats_path;
+    fout_vio_stats.open(path, std::ios::out | std::ios::app);
+  }
+
+  // Header: write once (columns description)
+  if (!vio_stats_header_written) {
+    fout_vio_stats << "# time(s), pre_rot_eig1, pre_rot_eig2, pre_rot_eig3, "
+                   << "pre_trans_eig1, pre_trans_eig2, pre_trans_eig3, "
+                   << "post_rot_eig1, post_rot_eig2, post_rot_eig3, "
+                   << "post_trans_eig1, post_trans_eig2, post_trans_eig3";
+    // Camera usage columns cam_used[0..N-1]
+    for (int cam = 0; cam < total_cam_count; ++cam) {
+      fout_vio_stats << ", cam_used[" << cam << "]";
+    }
+    // Only level 0 average total rows
+    fout_vio_stats << ", level0_avg_total_rows";
+    fout_vio_stats << std::endl;
+    vio_stats_header_written = true;
+  }
+
+  // Compute eigenvalues
+  Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es_rot_pre(rot_cov_pre);
+  Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es_trans_pre(trans_cov_pre);
+  Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es_rot_post(rot_cov_post);
+  Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es_trans_post(trans_cov_post);
+
+  Eigen::Vector3d rot_eigs_pre = es_rot_pre.eigenvalues();
+  Eigen::Vector3d trans_eigs_pre = es_trans_pre.eigenvalues();
+  Eigen::Vector3d rot_eigs_post = es_rot_post.eigenvalues();
+  Eigen::Vector3d trans_eigs_post = es_trans_post.eigenvalues();
+
+  // Data row
+  fout_vio_stats << std::setprecision(9) << std::fixed << cur_time << ", "
+                 << rot_eigs_pre(0) << ", " << rot_eigs_pre(1) << ", "
+                 << rot_eigs_pre(2) << ", " << trans_eigs_pre(0) << ", "
+                 << trans_eigs_pre(1) << ", " << trans_eigs_pre(2) << ", "
+                 << rot_eigs_post(0) << ", " << rot_eigs_post(1) << ", "
+                 << rot_eigs_post(2) << ", " << trans_eigs_post(0) << ", "
+                 << trans_eigs_post(1) << ", " << trans_eigs_post(2);
+
+  // Camera usage flags
+  std::vector<int> cam_flags(static_cast<size_t>(total_cam_count), 0);
+  for (int idx : used_cam_indices) {
+    if (idx >= 0 && idx < total_cam_count)
+      cam_flags[static_cast<size_t>(idx)] = 1;
+  }
+  for (int cam = 0; cam < total_cam_count; ++cam) {
+    fout_vio_stats << ", " << cam_flags[static_cast<size_t>(cam)];
+  }
+
+  // Append only level 0 average (convert rows to point count by dividing by
+  // patch_size_total)
+  double avg_level0_points = 0.0;
+  if (!vio_manager->level_avg_visual_points.empty()) {
+    avg_level0_points = vio_manager->level_avg_visual_points[0];
+  }
+  fout_vio_stats << ", " << avg_level0_points;
+  fout_vio_stats << std::endl;
 }
 
 void LIVMapper::handleLIO() {
@@ -523,16 +672,22 @@ void LIVMapper::handleLIO() {
   for (size_t i = 0; i < world_lidar->points.size(); i++) {
     voxelmap_manager->pv_list_[i].point_w << world_lidar->points[i].x,
         world_lidar->points[i].y, world_lidar->points[i].z;
-    M3D point_crossmat = voxelmap_manager->cross_mat_list_[i];
-    M3D var = voxelmap_manager->body_cov_list_[i];
-    var = (_state.rot_end * extR) * var * (_state.rot_end * extR).transpose() +
+    if (slam_mode_ == ONLY_LIO || !mapping_after_vio) {
+      M3D point_crossmat = voxelmap_manager->cross_mat_list_[i];
+      M3D var = voxelmap_manager->body_cov_list_[i];
+      var =
+          (_state.rot_end * extR) * var * (_state.rot_end * extR).transpose() +
           (-point_crossmat) * _state.cov.block<3, 3>(0, 0) *
               (-point_crossmat).transpose() +
           _state.cov.block<3, 3>(3, 3);
-    voxelmap_manager->pv_list_[i].var = var;
+      voxelmap_manager->pv_list_[i].var = var;
+    }
   }
-  voxelmap_manager->UpdateVoxelMap(voxelmap_manager->pv_list_);
-  std::cout << "[ LIO ] Update Voxel Map" << std::endl;
+
+  if (slam_mode_ == ONLY_LIO || !mapping_after_vio) {
+    voxelmap_manager->UpdateVoxelMap(voxelmap_manager->pv_list_);
+    std::cout << "[ LIO ] Update Voxel Map" << std::endl;
+  }
 
   _pv_list = voxelmap_manager->pv_list_;
 
@@ -595,33 +750,36 @@ void LIVMapper::handleLIO() {
     voxelmap_manager->mapSliding();
   }
 
-  PointCloudXYZI::Ptr laserCloudWorld(new PointCloudXYZI());
+  if (slam_mode_ == ONLY_LIO || !mapping_after_vio) {
 
-  if (dense_map_en) {
-    PointCloudXYZI::Ptr laserCloudFullRes(feats_undistort);
-    int size = laserCloudFullRes->points.size();
-    laserCloudWorld = PointCloudXYZI::Ptr(new PointCloudXYZI(size, 1));
-    for (int i = 0; i < size; i++) {
-      RGBpointBodyToWorld(&laserCloudFullRes->points[i],
-                          &laserCloudWorld->points[i]);
+    PointCloudXYZI::Ptr laserCloudWorld(new PointCloudXYZI());
+
+    if (dense_map_en) {
+      PointCloudXYZI::Ptr laserCloudFullRes(feats_undistort);
+      int size = laserCloudFullRes->points.size();
+      laserCloudWorld = PointCloudXYZI::Ptr(new PointCloudXYZI(size, 1));
+      for (int i = 0; i < size; i++) {
+        RGBpointBodyToWorld(&laserCloudFullRes->points[i],
+                            &laserCloudWorld->points[i]);
+      }
+
+    } else {
+      for (const auto &pair : _pv_prev) {
+        const auto &pv = pair.second;
+        PointType point;
+        point.x = pv.point_w(0);
+        point.y = pv.point_w(1);
+        point.z = pv.point_w(2);
+        // point.intensity = pv.intensity;
+        // point.curvature = pv.timestamp;
+        laserCloudWorld->points.push_back(point);
+      }
     }
 
-  } else {
-    for (const auto &pair : _pv_prev) {
-      const auto &pv = pair.second;
-      PointType point;
-      point.x = pv.point_w(0);
-      point.y = pv.point_w(1);
-      point.z = pv.point_w(2);
-      // point.intensity = pv.intensity;
-      // point.curvature = pv.timestamp;
-      laserCloudWorld->points.push_back(point);
-    }
+    // std::cout << "handleLIO _pv_prev size: " << _pv_prev.size() << std::endl;
+
+    *pcl_w_wait_pub = *laserCloudWorld;
   }
-
-  // std::cout << "handleLIO _pv_prev size: " << _pv_prev.size() << std::endl;
-
-  *pcl_w_wait_pub = *laserCloudWorld;
 
   if (!img_en)
     // std::cout << "handleLIO publish_frame_world: "
@@ -751,18 +909,23 @@ void LIVMapper::run() {
       "/mnt/c/Users/USER/Desktop/fast_livo2/results/" +
       std::to_string(int(ros::Time::now().toSec()) % 10000) + ".txt";
 
+  std::string stat_output_path =
+      "/mnt/c/Users/USER/Desktop/fast_livo2/results/" +
+      std::to_string(int(ros::Time::now().toSec()) % 10000) + "_stat.txt";
+
+  // set the VIO stats output path for writeVIOStats
+  vio_stats_path = stat_output_path;
+
   ros::Rate rate(5000);
   while (ros::ok()) {
-    ros::spinOnce(); // 처음에만 기본 ros제공 쓰고 나머지는 커스텀하려고
-    if (!sync_packages(
-            LidarMeasures)) // 다음 livo돌릴 수 있으면 돌리고 True 나옴.
-    {
+    ros::spinOnce();
+    if (!sync_packages(LidarMeasures)) {
       rate.sleep();
       continue;
     }
-    handleFirstFrame(); // 첫프레임만 돌아감 무시해도될듯
+    handleFirstFrame();
 
-    processImu(); // imu로 현재 라이더 프레임 정렬해서 더하기
+    processImu();
 
     // if (!p_imu->imu_time_init) continue;
 
@@ -1215,35 +1378,35 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas) {
       vector<double> key_frame_times;
 
       // [DEBUG]
-      const char block = '#';
-      const double time_unit = 0.01; // 0.01초 = 공백 1칸
+      // const char block = '#';
+      // const double time_unit = 0.01;
 
-      vector<double> fronts;
-      for (const auto &buf : m_img_time_buffers) {
-        if (!buf.empty()) {
-          fronts.push_back(buf.front());
-        } else {
-          fronts.push_back(numeric_limits<double>::max());
-        }
-      }
-      double min_time = *min_element(fronts.begin(), fronts.end());
+      // vector<double> fronts;
+      // for (const auto &buf : m_img_time_buffers) {
+      //   if (!buf.empty()) {
+      //     fronts.push_back(buf.front());
+      //   } else {
+      //     fronts.push_back(numeric_limits<double>::max());
+      //   }
+      // }
+      // double min_time = *min_element(fronts.begin(), fronts.end());
 
-      for (size_t i = 0; i < m_img_time_buffers.size(); ++i) {
-        size_t size = m_img_time_buffers[i].size();
-        if (size == 0) {
-          cout << "Buffer " << i << ": (empty)" << endl;
-          continue;
-        }
+      // for (size_t i = 0; i < m_img_time_buffers.size(); ++i) {
+      //   size_t size = m_img_time_buffers[i].size();
+      //   if (size == 0) {
+      //     cout << "Buffer " << i << ": (empty)" << endl;
+      //     continue;
+      //   }
 
-        double offset = fronts[i] - min_time;
-        int spaces = static_cast<int>(round(offset / time_unit));
+      //   double offset = fronts[i] - min_time;
+      //   int spaces = static_cast<int>(round(offset / time_unit));
 
-        cout << "Buffer " << i << ": ";
-        cout << string(spaces, ' ');
-        cout << string(size, block);
-        cout << " (" << size << ", offset: " << fixed << setprecision(6)
-             << offset << "s)" << endl;
-      }
+      //   cout << "Buffer " << i << ": ";
+      //   cout << string(spaces, ' ');
+      //   cout << string(size, block);
+      //   cout << " (" << size << ", offset: " << fixed << setprecision(6)
+      //        << offset << "s)" << endl;
+      // }
 
       int min_idx = -1;
       for (int i = 0; i < num_of_cam; i++) {

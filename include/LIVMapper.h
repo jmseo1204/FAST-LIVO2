@@ -17,6 +17,7 @@ which is included as part of this source code package.
 #include "common_lib.h"
 #include "preprocess.h"
 #include "vio.h"
+#include <Eigen/Core>
 #include <cv_bridge/cv_bridge.h>
 #include <deque>
 #include <image_transport/image_transport.h>
@@ -46,6 +47,11 @@ public:
   void handleLIO();
   void savePCD();
   void processImu();
+  void writeVIOStats(double cur_time, const Eigen::Matrix3d &rot_cov_pre,
+                     const Eigen::Matrix3d &trans_cov_pre,
+                     const Eigen::Matrix3d &rot_cov_post,
+                     const Eigen::Matrix3d &trans_cov_post, int total_cam_count,
+                     const std::vector<int> &used_cam_indices);
 
   bool sync_packages(LidarMeasureGroup &meas);
   void prop_imu_once(StatesGroup &imu_prop_state, const double dt, V3D acc_avr,
@@ -101,6 +107,7 @@ public:
   M3D extR;
 
   bool en_cam_backprop = false;
+  bool mapping_after_vio = false;
   double lidar_window_size = 0.1;
   int feats_down_size = 0, max_iterations = 0;
 
@@ -195,6 +202,9 @@ public:
   PointCloudXYZI::Ptr pcl_wait_save_intensity;
 
   ofstream fout_pre, fout_out, fout_pcd_pos, fout_points;
+  ofstream fout_vio_stats;
+  bool vio_stats_header_written = false;
+  std::string vio_stats_path;
 
   pcl::VoxelGrid<PointType> downSizeFilterSurf;
 

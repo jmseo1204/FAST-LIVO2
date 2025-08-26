@@ -100,6 +100,8 @@ public:
   std::vector<V3D> original_Pci_vec, original_Pcl_vec;
   // M3D original_Jdphi_dR, original_Jdp_dR;
 
+  int min_visual_points = 20;
+
   void processMultiCamVIO(
       const std::vector<cv::Mat> &imgs, const std::vector<int> &cam_indices,
       const std::vector<Pose6D> &imu_poses, multimap<double, pointWithVar> &pg,
@@ -250,6 +252,11 @@ public:
 
   // PointCloudXYZI::Ptr pg_down;
   // pcl::VoxelGrid<PointType> downSizeFilter;
+
+  // Statistics of visual constraints per pyramid level (per frame)
+  // After each processMultiCamVIO call, this will contain the per-level
+  // average of total row counts over iterations at that level for the frame.
+  std::vector<double> level_avg_visual_points;
 };
 typedef std::shared_ptr<VIOManager> VIOManagerPtr;
 
