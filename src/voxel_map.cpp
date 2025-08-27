@@ -362,7 +362,7 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat,
     point_this = extR_ * point_this + extT_;
     M3D point_crossmat;
     point_crossmat << SKEW_SYM_MATRX(state_.rot_end * point_this);
-    cross_mat_list_.push_back(point_crossmat);
+    cross_mat_list_.push_back(point_crossmat); // world coordiante
   }
 
   vector<pointWithVar>().swap(pv_list_);

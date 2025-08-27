@@ -12,7 +12,7 @@ common:
   img_en: 1
   lidar_en: 1
   ros_driver_bug_fix: false
-  sync_time_window: 0.8
+  sync_time_window: 0.03
   minimum_simultaneous_frame_num: 1
   lidar_window_size: 0.11
   en_cam_backprop: 1
@@ -73,6 +73,7 @@ vio: #일단 대충
   min_depth_threshold: 0.1
   max_depth_threshold: 100.0
   min_visual_points: 0
+  dismiss_non_outofbound_pixels_from_ref_patch: true
 
 imu: #일단 ig_lio/config/ncd.yaml 에서 가져옴
 

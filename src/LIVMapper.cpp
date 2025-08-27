@@ -616,6 +616,9 @@ void LIVMapper::handleLIO() {
 
   double t1 = omp_get_wtime();
 
+  // _pv_prev -> w->i convert
+  // _pv_prev + feats_down_body
+
   voxelmap_manager->StateEstimation(state_propagat, LidarMeasures);
   _state = voxelmap_manager->state_;
   _pv_list = voxelmap_manager->pv_list_;

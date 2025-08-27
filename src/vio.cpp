@@ -23,6 +23,8 @@ void VIOManager::readParameters(ros::NodeHandle &nh) {
   nh.param<float>("vio/min_depth_threshold", min_depth_threshold, 1.5);
   nh.param<float>("vio/max_depth_threshold", max_depth_threshold, 10.0);
   nh.param<int>("vio/min_visual_points", min_visual_points, 20);
+  nh.param<bool>("vio/dismiss_non_outofbound_pixels_from_ref_patch",
+                 dismiss_non_outofbound_pixels_from_ref_patch, false);
 
   ROS_INFO("VIO Parameters loaded - shiTomasiScore_threshold: %.1f, "
            "min_depth_threshold: %.1f, max_depth_threshold: %.1f",
@@ -357,7 +359,8 @@ void VIOManager::getWarpMatrixAffineHomography(
       (normal_ref.dot(xyz_ref) * Eigen::Matrix3d::Identity() -
        t * normal_ref.transpose());
   // Compute affine warp matrix A_ref_cur using homography projection
-  const int kHalfPatchSize = 4;
+  // const int kHalfPatchSize = 4;
+  const int kHalfPatchSize = patch_size_half;
   V3D f_du_ref(cam.cam2world(px_ref + Eigen::Vector2d(kHalfPatchSize, 0) *
                                           (1 << level_ref)));
   V3D f_dv_ref(cam.cam2world(px_ref + Eigen::Vector2d(0, kHalfPatchSize) *
@@ -493,8 +496,9 @@ void VIOManager::buildJacobianAndResiduals(const cv::Mat &img,
     V2D pc = cam->world2cam(pf);
 
     computeProjectionJacobian(pf, Jdpi);
+    Vector3d p_diff = pf + Rcw * Pwi - Pci;
     M3D p_hat;
-    p_hat << SKEW_SYM_MATRX(pf);
+    p_hat << SKEW_SYM_MATRX(p_diff); // p_c - t_cw
 
     int search_level = current_cam_submap->search_levels[i];
     int pyramid_level = level + search_level;
@@ -521,6 +525,17 @@ void VIOManager::buildJacobianAndResiduals(const cv::Mat &img,
           (v_ref_i + x * scale - patch_size_half * scale) * width + u_ref_i -
           patch_size_half * scale;
       for (int y = 0; y < patch_size; ++y, img_ptr += scale) {
+
+        int row_idx = i * patch_size_total + x * patch_size + y;
+
+        if (dismiss_non_outofbound_pixels_from_ref_patch) {
+          if (P[patch_size_total * level + x * patch_size + y] == 0.0) {
+            z_cam(row_idx) = 0.0;
+            H_sub_cam.row(row_idx).setZero();
+            continue;
+          }
+        }
+
         float du =
             0.5f * ((w_ref_tl * img_ptr[scale] + w_ref_tr * img_ptr[scale * 2] +
                      w_ref_bl * img_ptr[scale * width + scale] +
@@ -541,7 +556,14 @@ void VIOManager::buildJacobianAndResiduals(const cv::Mat &img,
 
         Jdphi = Jimg * Jdpi * p_hat;
         Jdp = -Jimg * Jdpi;
-        JdR = Jdphi * Jdphi_dR + Jdp * Jdp_dR;
+        // JdR = Jdphi * Jdphi_dR + Jdp * Jdp_dR;
+        Vector3d Rcw_Pwi = Pci - Pcw;
+        M3D Rcw_Pwi_hat;
+        Rcw_Pwi_hat << SKEW_SYM_MATRX(Rcw_Pwi); // p_c - t_cw
+        // p_c = R_cw*p_w + t_cw
+        // we need to get d_p_c/d_R_wi
+        JdR = Jdphi * Jdphi_dR +
+              Jdp * Rcw_Pwi_hat * Jdphi_dR; // delta_R_cw + delta_t_cw
         Jdt = Jdp * Jdp_dt;
 
         double cur_value = w_ref_tl * img_ptr[0] + w_ref_tr * img_ptr[scale] +
@@ -551,7 +573,6 @@ void VIOManager::buildJacobianAndResiduals(const cv::Mat &img,
             state->inv_expo_time * cur_value -
             inv_ref_expo * P[patch_size_total * level + x * patch_size + y];
 
-        int row_idx = i * patch_size_total + x * patch_size + y;
         z_cam(row_idx) = res;
 
         if (exposure_estimate_en) {
@@ -2152,198 +2173,204 @@ void VIOManager::processMultiCamVIO(
          "---+\033[0m\n");
 }
 
-void VIOManager::updateState(cv::Mat img, int level) {
-  if (total_points == 0)
-    return;
-  StatesGroup old_state = (*state);
+// void VIOManager::updateState(cv::Mat img, int level) {
+//   if (total_points == 0)
+//     return;
+//   StatesGroup old_state = (*state);
 
-  VectorXd z;
-  MatrixXd H_sub;
-  bool EKF_end = false;
-  float last_error = std::numeric_limits<float>::max();
+//   VectorXd z;
+//   MatrixXd H_sub;
+//   bool EKF_end = false;
+//   float last_error = std::numeric_limits<float>::max();
 
-  const int H_DIM = total_points * patch_size_total;
-  z.resize(H_DIM);
-  z.setZero();
-  H_sub.resize(H_DIM, 7);
-  H_sub.setZero();
+//   const int H_DIM = total_points * patch_size_total;
+//   z.resize(H_DIM);
+//   z.setZero();
+//   H_sub.resize(H_DIM, 7);
+//   H_sub.setZero();
 
-  for (int iteration = 0; iteration < max_iterations; iteration++) {
-    double t1 = omp_get_wtime();
+//   for (int iteration = 0; iteration < max_iterations; iteration++) {
+//     double t1 = omp_get_wtime();
 
-    M3D Rwi(state->rot_end);
-    V3D Pwi(state->pos_end);
-    Rcw = Rci * Rwi.transpose();
-    Pcw = -Rci * Rwi.transpose() * Pwi + Pci;
-    Jdp_dt = Rci * Rwi.transpose();
+//     M3D Rwi(state->rot_end);
+//     V3D Pwi(state->pos_end);
+//     Rcw = Rci * Rwi.transpose();
+//     Pcw = -Rci * Rwi.transpose() * Pwi + Pci;
+//     Jdp_dt = Rci * Rwi.transpose();
 
-    float error = 0.0;
-    int n_meas = 0;
-    // int max_threads = omp_get_max_threads();
-    // int desired_threads = std::min(max_threads, total_points);
-    // omp_set_num_threads(desired_threads);
+//     float error = 0.0;
+//     int n_meas = 0;
+//     // int max_threads = omp_get_max_threads();
+//     // int desired_threads = std::min(max_threads, total_points);
+//     // omp_set_num_threads(desired_threads);
 
-#ifdef MP_EN
-    omp_set_num_threads(MP_PROC_NUM);
-#pragma omp parallel for reduction(+ : error, n_meas)
-#endif
-    for (int i = 0; i < total_points; i++) {
-      // printf("thread is %d, i=%d, i address is %p\n", omp_get_thread_num(),
-      // i, &i);
-      MD(1, 2) Jimg;
-      MD(2, 3) Jdpi;
-      MD(1, 3) Jdphi, Jdp, JdR, Jdt;
+// #ifdef MP_EN
+//     omp_set_num_threads(MP_PROC_NUM);
+// #pragma omp parallel for reduction(+ : error, n_meas)
+// #endif
+//     for (int i = 0; i < total_points; i++) {
+//       // printf("thread is %d, i=%d, i address is %p\n",
+//       omp_get_thread_num(),
+//       // i, &i);
+//       MD(1, 2) Jimg;
+//       MD(2, 3) Jdpi;
+//       MD(1, 3) Jdphi, Jdp, JdR, Jdt;
 
-      float patch_error = 0.0;
-      int search_level = visual_submap->search_levels[i];
-      int pyramid_level = level + search_level;
-      int scale = (1 << pyramid_level);
-      float inv_scale = 1.0f / scale;
+//       float patch_error = 0.0;
+//       int search_level = visual_submap->search_levels[i];
+//       int pyramid_level = level + search_level;
+//       int scale = (1 << pyramid_level);
+//       float inv_scale = 1.0f / scale;
 
-      VisualPoint *pt = visual_submap->voxel_points[i];
+//       VisualPoint *pt = visual_submap->voxel_points[i];
 
-      if (pt == nullptr)
-        continue;
+//       if (pt == nullptr)
+//         continue;
 
-      V3D pf = Rcw * pt->pos_ + Pcw;
-      V2D pc = cam->world2cam(pf);
+//       V3D pf = Rcw * pt->pos_ + Pcw;
+//       V2D pc = cam->world2cam(pf);
 
-      computeProjectionJacobian(pf, Jdpi);
-      M3D p_hat;
-      p_hat << SKEW_SYM_MATRX(pf);
+//       computeProjectionJacobian(pf, Jdpi);
+//       M3D p_hat;
+//       p_hat << SKEW_SYM_MATRX(pf);
 
-      float u_ref = pc[0];
-      float v_ref = pc[1];
-      int u_ref_i = floorf(pc[0] / scale) * scale;
-      int v_ref_i = floorf(pc[1] / scale) * scale;
-      float subpix_u_ref = (u_ref - u_ref_i) / scale;
-      float subpix_v_ref = (v_ref - v_ref_i) / scale;
-      float w_ref_tl = (1.0 - subpix_u_ref) * (1.0 - subpix_v_ref);
-      float w_ref_tr = subpix_u_ref * (1.0 - subpix_v_ref);
-      float w_ref_bl = (1.0 - subpix_u_ref) * subpix_v_ref;
-      float w_ref_br = subpix_u_ref * subpix_v_ref;
+//       float u_ref = pc[0];
+//       float v_ref = pc[1];
+//       int u_ref_i = floorf(pc[0] / scale) * scale;
+//       int v_ref_i = floorf(pc[1] / scale) * scale;
+//       float subpix_u_ref = (u_ref - u_ref_i) / scale;
+//       float subpix_v_ref = (v_ref - v_ref_i) / scale;
+//       float w_ref_tl = (1.0 - subpix_u_ref) * (1.0 - subpix_v_ref);
+//       float w_ref_tr = subpix_u_ref * (1.0 - subpix_v_ref);
+//       float w_ref_bl = (1.0 - subpix_u_ref) * subpix_v_ref;
+//       float w_ref_br = subpix_u_ref * subpix_v_ref;
 
-      vector<float> P = visual_submap->warp_patch[i];
-      double inv_ref_expo = visual_submap->inv_expo_list[i];
-      // ROS_ERROR("inv_ref_expo: %.3lf, state->inv_expo_time: %.3lf\n",
-      // inv_ref_expo, state->inv_expo_time);
+//       vector<float> P = visual_submap->warp_patch[i];
+//       double inv_ref_expo = visual_submap->inv_expo_list[i];
+//       // ROS_ERROR("inv_ref_expo: %.3lf, state->inv_expo_time: %.3lf\n",
+//       // inv_ref_expo, state->inv_expo_time);
 
-      for (int x = 0; x < patch_size; x++) {
-        uint8_t *img_ptr =
-            (uint8_t *)img.data +
-            (v_ref_i + x * scale - patch_size_half * scale) * width + u_ref_i -
-            patch_size_half * scale;
-        for (int y = 0; y < patch_size; ++y, img_ptr += scale) {
-          float du =
-              0.5f *
-              ((w_ref_tl * img_ptr[scale] + w_ref_tr * img_ptr[scale * 2] +
-                w_ref_bl * img_ptr[scale * width + scale] +
-                w_ref_br * img_ptr[scale * width + scale * 2]) -
-               (w_ref_tl * img_ptr[-scale] + w_ref_tr * img_ptr[0] +
-                w_ref_bl * img_ptr[scale * width - scale] +
-                w_ref_br * img_ptr[scale * width]));
-          float dv =
-              0.5f * ((w_ref_tl * img_ptr[scale * width] +
-                       w_ref_tr * img_ptr[scale + scale * width] +
-                       w_ref_bl * img_ptr[width * scale * 2] +
-                       w_ref_br * img_ptr[width * scale * 2 + scale]) -
-                      (w_ref_tl * img_ptr[-scale * width] +
-                       w_ref_tr * img_ptr[-scale * width + scale] +
-                       w_ref_bl * img_ptr[0] + w_ref_br * img_ptr[scale]));
+//       for (int x = 0; x < patch_size; x++) {
+//         uint8_t *img_ptr =
+//             (uint8_t *)img.data +
+//             (v_ref_i + x * scale - patch_size_half * scale) * width + u_ref_i
+//             - patch_size_half * scale;
+//         for (int y = 0; y < patch_size; ++y, img_ptr += scale) {
+//           float du =
+//               0.5f *
+//               ((w_ref_tl * img_ptr[scale] + w_ref_tr * img_ptr[scale * 2] +
+//                 w_ref_bl * img_ptr[scale * width + scale] +
+//                 w_ref_br * img_ptr[scale * width + scale * 2]) -
+//                (w_ref_tl * img_ptr[-scale] + w_ref_tr * img_ptr[0] +
+//                 w_ref_bl * img_ptr[scale * width - scale] +
+//                 w_ref_br * img_ptr[scale * width]));
+//           float dv =
+//               0.5f * ((w_ref_tl * img_ptr[scale * width] +
+//                        w_ref_tr * img_ptr[scale + scale * width] +
+//                        w_ref_bl * img_ptr[width * scale * 2] +
+//                        w_ref_br * img_ptr[width * scale * 2 + scale]) -
+//                       (w_ref_tl * img_ptr[-scale * width] +
+//                        w_ref_tr * img_ptr[-scale * width + scale] +
+//                        w_ref_bl * img_ptr[0] + w_ref_br * img_ptr[scale]));
 
-          Jimg << du, dv;
-          Jimg = Jimg * state->inv_expo_time;
-          Jimg = Jimg * inv_scale;
-          Jdphi = Jimg * Jdpi * p_hat;
-          Jdp = -Jimg * Jdpi;
-          JdR = Jdphi * Jdphi_dR + Jdp * Jdp_dR;
-          Jdt = Jdp * Jdp_dt;
+//           Jimg << du, dv;
+//           Jimg = Jimg * state->inv_expo_time;
+//           Jimg = Jimg * inv_scale;
+//           Jdphi = Jimg * Jdpi * p_hat;
+//           Jdp = -Jimg * Jdpi;
+//           JdR = Jdphi * Jdphi_dR + Jdp * Jdp_dR;
+//           Jdt = Jdp * Jdp_dt;
 
-          double cur_value = w_ref_tl * img_ptr[0] + w_ref_tr * img_ptr[scale] +
-                             w_ref_bl * img_ptr[scale * width] +
-                             w_ref_br * img_ptr[scale * width + scale];
-          double res =
-              state->inv_expo_time * cur_value -
-              inv_ref_expo * P[patch_size_total * level + x * patch_size + y];
+//           double cur_value = w_ref_tl * img_ptr[0] + w_ref_tr *
+//           img_ptr[scale] +
+//                              w_ref_bl * img_ptr[scale * width] +
+//                              w_ref_br * img_ptr[scale * width + scale];
+//           double res =
+//               state->inv_expo_time * cur_value -
+//               inv_ref_expo * P[patch_size_total * level + x * patch_size +
+//               y];
 
-          z(i * patch_size_total + x * patch_size + y) = res;
+//           z(i * patch_size_total + x * patch_size + y) = res;
 
-          patch_error += res * res;
-          n_meas += 1;
+//           patch_error += res * res;
+//           n_meas += 1;
 
-          if (exposure_estimate_en) {
-            H_sub.block<1, 7>(i * patch_size_total + x * patch_size + y, 0)
-                << JdR,
-                Jdt, cur_value;
-          } else {
-            H_sub.block<1, 6>(i * patch_size_total + x * patch_size + y, 0)
-                << JdR,
-                Jdt;
-          }
-        }
-      }
-      visual_submap->errors[i] = patch_error;
-      error += patch_error;
-    }
+//           if (exposure_estimate_en) {
+//             H_sub.block<1, 7>(i * patch_size_total + x * patch_size + y, 0)
+//                 << JdR,
+//                 Jdt, cur_value;
+//           } else {
+//             H_sub.block<1, 6>(i * patch_size_total + x * patch_size + y, 0)
+//                 << JdR,
+//                 Jdt;
+//           }
+//         }
+//       }
+//       visual_submap->errors[i] = patch_error;
+//       error += patch_error;
+//     }
 
-    error = error / n_meas;
+//     error = error / n_meas;
 
-    compute_jacobian_time += omp_get_wtime() - t1;
+//     compute_jacobian_time += omp_get_wtime() - t1;
 
-    // printf("\nPYRAMID LEVEL %i\n---------------\n", level);
-    // std::cout << "It. " << iteration
-    //           << "\t last_error = " << last_error
-    //           << "\t new_error = " << error
-    //           << std::endl;
+//     // printf("\nPYRAMID LEVEL %i\n---------------\n", level);
+//     // std::cout << "It. " << iteration
+//     //           << "\t last_error = " << last_error
+//     //           << "\t new_error = " << error
+//     //           << std::endl;
 
-    double t3 = omp_get_wtime();
+//     double t3 = omp_get_wtime();
 
-    if (error <= last_error) {
-      old_state = (*state);
-      last_error = error;
+//     if (error <= last_error) {
+//       old_state = (*state);
+//       last_error = error;
 
-      // K = (H.transpose() / img_point_cov * H +
-      // state->cov.inverse()).inverse() * H.transpose() / img_point_cov; auto
-      // vec = (*state_propagat) - (*state); G = K*H;
-      // (*state) += (-K*z + vec - G*vec);
+//       // K = (H.transpose() / img_point_cov * H +
+//       // state->cov.inverse()).inverse() * H.transpose() / img_point_cov;
+//       auto
+//       // vec = (*state_propagat) - (*state); G = K*H;
+//       // (*state) += (-K*z + vec - G*vec);
 
-      auto &&H_sub_T = H_sub.transpose();
-      H_T_H.setZero();
-      G.setZero();
-      H_T_H.block<7, 7>(0, 0) = H_sub_T * H_sub;
-      MD(DIM_STATE, DIM_STATE) &&K_1 =
-          (H_T_H + (state->cov / img_point_cov).inverse()).inverse();
-      auto &&HTz = H_sub_T * z;
-      // K = K_1.block<DIM_STATE,6>(0,0) * H_sub_T;
-      auto vec = (*state_propagat) - (*state);
-      G.block<DIM_STATE, 7>(0, 0) =
-          K_1.block<DIM_STATE, 7>(0, 0) * H_T_H.block<7, 7>(0, 0);
-      MD(DIM_STATE, 1)
-      solution = -K_1.block<DIM_STATE, 7>(0, 0) * HTz + vec -
-                 G.block<DIM_STATE, 7>(0, 0) * vec.block<7, 1>(0, 0);
+//       auto &&H_sub_T = H_sub.transpose();
+//       H_T_H.setZero();
+//       G.setZero();
+//       H_T_H.block<7, 7>(0, 0) = H_sub_T * H_sub;
+//       MD(DIM_STATE, DIM_STATE) &&K_1 =
+//           (H_T_H + (state->cov / img_point_cov).inverse()).inverse();
+//       auto &&HTz = H_sub_T * z;
+//       // K = K_1.block<DIM_STATE,6>(0,0) * H_sub_T;
+//       auto vec = (*state_propagat) - (*state);
+//       G.block<DIM_STATE, 7>(0, 0) =
+//           K_1.block<DIM_STATE, 7>(0, 0) * H_T_H.block<7, 7>(0, 0);
+//       MD(DIM_STATE, 1)
+//       solution = -K_1.block<DIM_STATE, 7>(0, 0) * HTz + vec -
+//                  G.block<DIM_STATE, 7>(0, 0) * vec.block<7, 1>(0, 0);
 
-      (*state) += solution;
-      auto &&rot_add = solution.block<3, 1>(0, 0);
-      auto &&t_add = solution.block<3, 1>(3, 0);
+//       (*state) += solution;
+//       auto &&rot_add = solution.block<3, 1>(0, 0);
+//       auto &&t_add = solution.block<3, 1>(3, 0);
 
-      auto &&expo_add = solution.block<1, 1>(6, 0);
-      // if ((rot_add.norm() * 57.3f < 0.001f) && (t_add.norm() * 100.0f <
-      // 0.001f) && (expo_add.norm() < 0.001f)) EKF_end = true;
-      if ((rot_add.norm() * 57.3f < 0.001f) && (t_add.norm() * 100.0f < 0.001f))
-        EKF_end = true;
-    } else {
-      (*state) = old_state;
-      EKF_end = true;
-    }
+//       auto &&expo_add = solution.block<1, 1>(6, 0);
+//       // if ((rot_add.norm() * 57.3f < 0.001f) && (t_add.norm() * 100.0f <
+//       // 0.001f) && (expo_add.norm() < 0.001f)) EKF_end = true;
+//       if ((rot_add.norm() * 57.3f < 0.001f) && (t_add.norm() * 100.0f <
+//       0.001f))
+//         EKF_end = true;
+//     } else {
+//       (*state) = old_state;
+//       EKF_end = true;
+//     }
 
-    update_ekf_time += omp_get_wtime() - t3;
+//     update_ekf_time += omp_get_wtime() - t3;
 
-    if (iteration == max_iterations || EKF_end)
-      break;
-  }
-  // if (state->inv_expo_time < 0.0)  {ROS_ERROR("reset expo time!!!!!!!!!!\n");
-  // state->inv_expo_time = 0.0;}
-}
+//     if (iteration == max_iterations || EKF_end)
+//       break;
+//   }
+//   // if (state->inv_expo_time < 0.0)  {ROS_ERROR("reset expo
+//   time!!!!!!!!!!\n");
+//   // state->inv_expo_time = 0.0;}
+// }
 
 void VIOManager::updateFrameState(StatesGroup state) {
   M3D Rwi(state.rot_end);

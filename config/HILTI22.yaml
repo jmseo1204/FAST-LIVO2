@@ -101,6 +101,7 @@ vio:
   min_depth_threshold: 0.0
   max_depth_threshold: 100.0
   min_visual_points: 0
+  dismiss_non_outofbound_pixels_from_ref_patch: true
 
 imu:
   imu_en: true

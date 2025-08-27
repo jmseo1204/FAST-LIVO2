@@ -145,6 +145,7 @@ public:
   bool normal_en, inverse_composition_en, exposure_estimate_en, raycast_en,
       has_ref_patch_cache;
   bool ncc_en = false, colmap_output_en = false;
+  bool dismiss_non_outofbound_pixels_from_ref_patch = false;
 
   int width, height, grid_n_width, grid_n_height, length;
   double image_resize_factor;
@@ -198,7 +199,7 @@ public:
                           const std::vector<cv::Mat> &pyramid_images);
 
   void updateStateInverse(cv::Mat img, int level);
-  void updateState(cv::Mat img, int level);
+  // void updateState(cv::Mat img, int level);
   void
   processFrame(cv::Mat &img, multimap<double, pointWithVar> &pg,
                const unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &feat_map,
