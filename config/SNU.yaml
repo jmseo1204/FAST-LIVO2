@@ -15,6 +15,7 @@ common:
   sync_time_window: 0.03
   minimum_simultaneous_frame_num: 1
   lidar_window_size: 0.11
+  en_sliding_window_ICP: false
   en_cam_backprop: 1
   only_side_cam: 0
   mapping_after_vio: false
@@ -74,6 +75,7 @@ vio: #일단 대충
   max_depth_threshold: 100.0
   min_visual_points: 0
   dismiss_non_outofbound_pixels_from_ref_patch: true
+  en_error_LERP_backprop: true
 
 imu: #일단 ig_lio/config/ncd.yaml 에서 가져옴
 

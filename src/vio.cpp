@@ -25,6 +25,7 @@ void VIOManager::readParameters(ros::NodeHandle &nh) {
   nh.param<int>("vio/min_visual_points", min_visual_points, 20);
   nh.param<bool>("vio/dismiss_non_outofbound_pixels_from_ref_patch",
                  dismiss_non_outofbound_pixels_from_ref_patch, false);
+  nh.param<bool>("vio/en_error_LERP_backprop", en_error_LERP_backprop, false);
 
   ROS_INFO("VIO Parameters loaded - shiTomasiScore_threshold: %.1f, "
            "min_depth_threshold: %.1f, max_depth_threshold: %.1f",
@@ -744,8 +745,12 @@ void VIOManager::retrieveFromVisualSparseMap(
     cv::Mat img, multimap<double, pointWithVar> &pg,
     const unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &plane_map,
     int cam_idx) {
+
   if (feat_map.size() <= 0)
     return;
+
+  // std::cout << "retrieveFromVisualSparseMap" << std::endl;
+
   double ts0 = omp_get_wtime();
 
   // pg_down->reserve(feat_map.size());
@@ -2622,9 +2627,7 @@ void VIOManager::setCameraTimeOffsets(
   for (const auto &pair : time_offsets) {
     int cam_idx = pair.first;
     double offset = pair.second;
-    if (cam_idx < m_img_time_offsets_from_last_update.size()) {
-      m_img_time_offsets_from_last_update[cam_idx] = offset;
-    }
+    m_img_time_offsets_from_last_update[cam_idx] = offset;
   }
 }
 
@@ -2653,10 +2656,11 @@ void VIOManager::compensateExtrinsicsByTimeOffset(
   double target_offset_time = m_img_time_offsets_from_last_update[cam_idx];
 
   const auto &pose_at_kf = imu_poses.back();
-  M3D R_at_kf;
-  R_at_kf << MAT_FROM_ARRAY(pose_at_kf.rot);
-  V3D P_at_kf;
-  P_at_kf << VEC_FROM_ARRAY(pose_at_kf.pos);
+  std::cout << "imu_poses leng: " << imu_poses.size() << std::endl;
+  // M3D R_at_kf;
+  // R_at_kf << MAT_FROM_ARRAY(pose_at_kf.rot);
+  // V3D P_at_kf;
+  // P_at_kf << VEC_FROM_ARRAY(pose_at_kf.pos);
 
   if ((target_offset_time - pose_at_kf.offset_time) > -1e-6) {
     std::cout << "[ DEBUG ] cam" << cam_idx << " is not compensated"
@@ -2664,40 +2668,99 @@ void VIOManager::compensateExtrinsicsByTimeOffset(
     return;
   }
 
-  auto it_kp = imu_poses.end() - 1;
-  for (; it_kp != imu_poses.begin(); it_kp--) {
-    if (it_kp->offset_time < target_offset_time) {
-      break;
+  double time_ratio = target_offset_time / pose_at_kf.offset_time;
+
+  Eigen::Matrix4d T_update_k;
+
+  if (en_error_LERP_backprop) {
+
+    auto it_kp = imu_poses.end() - 1;
+    for (; it_kp != imu_poses.begin(); it_kp--) {
+      if (it_kp->offset_time < target_offset_time) {
+        break;
+      }
     }
+    // std::cout << "[ DEBUG ] cam" << cam_idx
+    //           << " IMUpose length: " << imu_poses.end() - 1 - it_kp <<
+    //           std::endl;
+
+    auto head = it_kp;
+    auto tail = it_kp + 1;
+
+    double dt = target_offset_time - head->offset_time;
+    double head_tail_dt = tail->offset_time - head->offset_time;
+    double s = dt / head_tail_dt;
+
+    M3D R_at_head;
+    R_at_head << MAT_FROM_ARRAY(head->rot);
+    V3D P_at_head;
+    P_at_head << VEC_FROM_ARRAY(head->pos);
+    M3D R_at_tail;
+    R_at_tail << MAT_FROM_ARRAY(tail->rot);
+    V3D P_at_tail;
+    P_at_tail << VEC_FROM_ARRAY(tail->pos);
+
+    // M3D R_at_img_time = Eigen::Quaterniond(R_at_head)
+    //                         .slerp(s, Eigen::Quaterniond(R_at_tail))
+    //                         .toRotationMatrix();
+    // V3D P_at_img_time = (1.0 - s) * P_at_head + s * P_at_tail;
+
+    Eigen::Matrix4d T_head = Eigen::Matrix4d::Identity();
+    T_head.block<3, 3>(0, 0) = R_at_head;
+    T_head.block<3, 1>(0, 3) = P_at_head;
+
+    Eigen::Matrix4d T_tail = Eigen::Matrix4d::Identity();
+    T_tail.block<3, 3>(0, 0) = R_at_tail;
+    T_tail.block<3, 1>(0, 3) = P_at_tail;
+
+    // T_{tail -> head}
+    Eigen::Matrix4d T_relative = T_head.inverse() * T_tail;
+    // 4x4 twist
+    Eigen::Matrix4d xi_hat = T_relative.log();
+    Eigen::Matrix4d xi_hat_interpolated = s * xi_hat;
+    Eigen::Matrix4d T_relative_interpolated = xi_hat_interpolated.exp();
+    Eigen::Matrix4d T_prop_k = T_head * T_relative_interpolated;
+
+    // double time_ratio = target_offset_time / pose_at_kf.offset_time;
+
+    Eigen::Matrix4d T_prop_1 = Eigen::Matrix4d::Identity();
+    T_prop_1.block<3, 3>(0, 0) = state_propagat->rot_end;
+    T_prop_1.block<3, 1>(0, 3) = state_propagat->pos_end;
+
+    Eigen::Matrix4d T_update_1 = Eigen::Matrix4d::Identity();
+    T_update_1.block<3, 3>(0, 0) = state->rot_end;
+    T_update_1.block<3, 1>(0, 3) = state->pos_end;
+
+    Eigen::Matrix4d delta_T_corr = T_prop_1.inverse() * T_update_1;
+    Eigen::Matrix4d xi_corr_total = delta_T_corr.log();
+    Eigen::Matrix4d xi_corr_k = time_ratio * xi_corr_total;
+    Eigen::Matrix4d delta_T_corr_k = xi_corr_k.exp();
+
+    T_update_k = T_prop_k * delta_T_corr_k;
+
+  } else {
+    Eigen::Matrix4d T_state_prev = Eigen::Matrix4d::Identity();
+    T_state_prev.block<3, 3>(0, 0) = state_prev->rot_end;
+    T_state_prev.block<3, 1>(0, 3) = state_prev->pos_end;
+
+    Eigen::Matrix4d T_update_1 = Eigen::Matrix4d::Identity();
+    T_update_1.block<3, 3>(0, 0) = state->rot_end;
+    T_update_1.block<3, 1>(0, 3) = state->pos_end;
+
+    // T_{tail -> head}
+    Eigen::Matrix4d T_relative = T_state_prev.inverse() * T_update_1;
+    // 4x4 twist
+    Eigen::Matrix4d xi_hat = T_relative.log();
+    Eigen::Matrix4d xi_hat_interpolated = time_ratio * xi_hat;
+    Eigen::Matrix4d T_relative_interpolated = xi_hat_interpolated.exp();
+
+    T_update_k = T_state_prev * T_relative_interpolated;
   }
-  std::cout << "[ DEBUG ] cam" << cam_idx
-            << " IMUpose length: " << imu_poses.end() - 1 - it_kp << std::endl;
 
-  auto head = it_kp;
-  auto tail = it_kp + 1;
-
-  double dt = target_offset_time - head->offset_time;
-  double head_tail_dt = tail->offset_time - head->offset_time;
-  double s = dt / head_tail_dt;
-
-  M3D R_at_head;
-  R_at_head << MAT_FROM_ARRAY(head->rot);
-  V3D P_at_head;
-  P_at_head << VEC_FROM_ARRAY(head->pos);
-  M3D R_at_tail;
-  R_at_tail << MAT_FROM_ARRAY(tail->rot);
-  V3D P_at_tail;
-  P_at_tail << VEC_FROM_ARRAY(tail->pos);
-
-  M3D R_at_img_time = Eigen::Quaterniond(R_at_head)
-                          .slerp(s, Eigen::Quaterniond(R_at_tail))
-                          .toRotationMatrix();
-  V3D P_at_img_time = (1.0 - s) * P_at_head + s * P_at_tail;
-
-  M3D R_w_kf = R_at_kf;
-  V3D P_w_kf = P_at_kf;
-  M3D R_w_img = R_at_img_time;
-  V3D P_w_img = P_at_img_time;
+  M3D R_w_img = T_update_k.block<3, 3>(0, 0);
+  V3D P_w_img = T_update_k.block<3, 1>(0, 3);
+  M3D R_w_kf = state->rot_end;
+  V3D P_w_kf = state->pos_end;
 
   M3D R_kf_img = R_w_kf.transpose() * R_w_img;
   V3D P_kf_img = R_w_kf.transpose() * (P_w_img - P_w_kf);

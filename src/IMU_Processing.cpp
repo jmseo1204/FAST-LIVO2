@@ -242,6 +242,9 @@ void ImuProcess::UpdateStateAndIMUpose(LidarMeasureGroup &lidar_meas,
 
   const double &imu_beg_time = v_imu.front()->header.stamp.toSec();
   const double &imu_end_time = v_imu.back()->header.stamp.toSec();
+  if (last_prop_end_time == 0.0) {
+    last_prop_end_time = imu_beg_time - 0.000001;
+  }
   const double prop_beg_time = last_prop_end_time;
   // printf("[ IMU ] undistort input size: %zu \n",
   // lidar_meas.pcl_proc_cur->points.size()); printf("[ IMU ] IMU data sequence
@@ -507,8 +510,10 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas,
   last_imu = v_imu.back();
   last_prop_end_time = prop_end_time;
 
-  if (pcl_wait_proc.points.size() < 1)
+  if (pcl_wait_proc.points.size() < 1) {
+    std::cout << "No point in pcl_wait_proc" << std::endl;
     return;
+  }
 
   /*** undistort each lidar point (backward propagation), ONLY working for LIO
    * update ***/
@@ -612,7 +617,7 @@ void ImuProcess::Process2(LidarMeasureGroup &lidar_meas, StatesGroup &stat,
       fout_imu.open(DEBUG_FILE_DIR("imu.txt"), ios::out);
     }
 
-    return;
+    // return;
   }
 
   UpdateStateAndIMUpose(lidar_meas, IMUstat, false);

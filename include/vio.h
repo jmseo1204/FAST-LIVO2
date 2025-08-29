@@ -20,6 +20,7 @@ which is included as part of this source code package.
 #include <opencv2/imgproc/imgproc_c.h>
 #include <pcl/filters/voxel_grid.h>
 #include <set>
+#include <unsupported/Eigen/MatrixFunctions>
 #include <vikit/math_utils.h>
 #include <vikit/pinhole_camera.h>
 #include <vikit/robust_cost.h>
@@ -135,6 +136,7 @@ public:
   vk::PinholeCamera *pinhole_cam;
   StatesGroup *state;
   StatesGroup *state_propagat;
+  StatesGroup *state_prev;
   vector<int> grid_num;
   vector<int> map_index;
   vector<int> border_flag;
@@ -146,6 +148,7 @@ public:
       has_ref_patch_cache;
   bool ncc_en = false, colmap_output_en = false;
   bool dismiss_non_outofbound_pixels_from_ref_patch = false;
+  bool en_error_LERP_backprop = false;
 
   int width, height, grid_n_width, grid_n_height, length;
   double image_resize_factor;

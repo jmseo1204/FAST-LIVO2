@@ -52,6 +52,7 @@ LIVMapper::~LIVMapper() {}
 
 void LIVMapper::readParameters(ros::NodeHandle &nh) {
 
+  nh.param<bool>("common/en_sliding_window_ICP", en_sliding_window_ICP, false);
   nh.param<bool>("common/only_side_cam", only_side_cam, false);
   nh.param<bool>("common/mapping_after_vio", mapping_after_vio, false);
   nh.param<bool>("common/en_cam_backprop", en_cam_backprop, false);
@@ -185,6 +186,7 @@ void LIVMapper::initializeComponents() {
       num_of_cam, new unordered_map<VOXEL_LOCATION, int>());
 
   vio_manager->state = &_state;
+  vio_manager->state_prev = &_state_prev;
   vio_manager->state_propagat = &state_propagat;
   vio_manager->max_iterations = max_iterations;
   vio_manager->img_point_cov = IMG_POINT_COV;
@@ -325,10 +327,13 @@ void LIVMapper::gravityAlignment(StatesGroup &state) {
   }
 }
 
-void LIVMapper::processImu() {
+bool LIVMapper::processImu() {
   // double t0 = omp_get_wtime();
 
+  _state_prev = _state;
   p_imu->Process2(LidarMeasures, _state, last_IMU_state, feats_undistort);
+  if (p_imu->imu_need_init)
+    return false;
 
   if (gravity_align_en) {
     gravityAlignment(_state); // 중력방향으로 z축 맞추는거 할지말지
@@ -340,6 +345,8 @@ void LIVMapper::processImu() {
   voxelmap_manager->feats_undistort_ = feats_undistort;
 
   publish_odometry(pubImuPredictedOdom, last_IMU_state);
+
+  return true;
 
   // double t_prop = omp_get_wtime();
   // std::cout << "[ Mapping ] feats_undistort: " << feats_undistort->size() <<
@@ -424,6 +431,10 @@ void LIVMapper::handleVIO() {
     }
 
     voxelmap_manager->UpdateVoxelMap(voxelmap_manager->pv_list_);
+    if (voxelmap_manager->config_setting_.map_sliding_en) {
+      voxelmap_manager->mapSliding();
+    }
+
     std::cout << "[ AFTER VIO ] Update Voxel Map" << std::endl;
 
     _pv_list = voxelmap_manager->pv_list_;
@@ -602,22 +613,57 @@ void LIVMapper::handleLIO() {
 
   double t_down = omp_get_wtime();
 
-  feats_down_size = feats_down_body->points.size();
-  voxelmap_manager->feats_down_body_ = feats_down_body;
-  transformLidar(_state.rot_end, _state.pos_end, feats_down_body,
-                 feats_down_world);
-  voxelmap_manager->feats_down_world_ = feats_down_world;
-  voxelmap_manager->feats_down_size_ = feats_down_size;
-
   if (!lidar_map_inited) {
     lidar_map_inited = true;
+    voxelmap_manager->feats_down_body_ = feats_down_body;
+    transformLidar(_state.rot_end, _state.pos_end, feats_down_body,
+                   feats_down_world);
+    voxelmap_manager->feats_down_world_ = feats_down_world;
     voxelmap_manager->BuildVoxelMap();
   }
 
   double t1 = omp_get_wtime();
 
-  // _pv_prev -> w->i convert
-  // _pv_prev + feats_down_body
+  PointCloudXYZI::Ptr feats_down_body_combined(new PointCloudXYZI());
+
+  if (en_sliding_window_ICP) {
+
+    MeasureGroup &meas = LidarMeasures.measures.back();
+
+    while (!(_pv_prev.empty() ||
+             (_pv_prev.begin()->first + lidar_window_size) >= meas.lio_time)) {
+      _pv_prev.erase(_pv_prev.begin());
+    }
+
+    // 1) _pv_prev 를 feats_down_body와 동일한 클래스타입으로 변환시킨 객체
+    // feats_down_world_prev 만들기
+    PointCloudXYZI::Ptr feats_down_world_prev(new PointCloudXYZI());
+    for (const auto &pair : _pv_prev) {
+      const pointWithVar &pv = pair.second;
+      PointType point;
+      point.x = pv.point_w(0);
+      point.y = pv.point_w(1);
+      point.z = pv.point_w(2);
+      // point.intensity = 0.0;
+      feats_down_world_prev->points.push_back(point);
+    }
+
+    PointCloudXYZI::Ptr feats_down_body_prev(new PointCloudXYZI());
+    transformLidar(_state.rot_end.transpose(),
+                   -_state.rot_end.transpose() * _state.pos_end,
+                   feats_down_world_prev, feats_down_body_prev);
+
+    // 2) feats_down_body 앞에  feats_down_body_prev 더하기 (i.e.
+    // feats_down_body
+    // <- concat(feats_down_body_prev, feats_down_body))
+    *feats_down_body_combined = *feats_down_body_prev + *feats_down_body;
+  } else {
+    *feats_down_body_combined = *feats_down_body;
+  }
+
+  feats_down_size = feats_down_body_combined->points.size();
+  voxelmap_manager->feats_down_body_ = feats_down_body_combined;
+  voxelmap_manager->feats_down_size_ = feats_down_size;
 
   voxelmap_manager->StateEstimation(state_propagat, LidarMeasures);
   _state = voxelmap_manager->state_;
@@ -672,6 +718,7 @@ void LIVMapper::handleLIO() {
 
   PointCloudXYZI::Ptr world_lidar(new PointCloudXYZI());
   transformLidar(_state.rot_end, _state.pos_end, feats_down_body, world_lidar);
+
   for (size_t i = 0; i < world_lidar->points.size(); i++) {
     voxelmap_manager->pv_list_[i].point_w << world_lidar->points[i].x,
         world_lidar->points[i].y, world_lidar->points[i].z;
@@ -690,56 +737,19 @@ void LIVMapper::handleLIO() {
   if (slam_mode_ == ONLY_LIO || !mapping_after_vio) {
     voxelmap_manager->UpdateVoxelMap(voxelmap_manager->pv_list_);
     std::cout << "[ LIO ] Update Voxel Map" << std::endl;
+
+    if (voxelmap_manager->config_setting_.map_sliding_en) {
+      voxelmap_manager->mapSliding();
+    }
   }
 
   _pv_list = voxelmap_manager->pv_list_;
 
-  double min_timestamp = std::numeric_limits<double>::max();
-  double max_timestamp = std::numeric_limits<double>::lowest();
-
   for (const auto &point : _pv_list) {
     _pv_prev.insert({point.timestamp, point});
-
-    // timestamp의 최대값과 최소값 업데이트
-    if (point.timestamp < min_timestamp) {
-      min_timestamp = point.timestamp;
-    }
-    if (point.timestamp > max_timestamp) {
-      max_timestamp = point.timestamp;
-    }
-
-    // std::cout << "[Inserted] point.timestamp: " << point.timestamp <<
-    // std::endl;
   }
-
-  // std::cout << "[Timestamp Range] min: " << min_timestamp
-  //           << ", max: " << max_timestamp << std::endl;
-
-  // std::cout << "[ _pv_prev.size() ] : " << _pv_prev.size() << std::endl;
-
-  // std::cout << "[ _pv_prev.front().timestamp] : " << std::fixed
-  //           << std::setprecision(6) << _pv_prev.begin()->first <<
-  //           std::endl;
-  // std::cout << "[ _pv_prev.back().timestamp] : " << std::fixed
-  //           << std::setprecision(6) << _pv_prev.rbegin()->first <<
-  //           std::endl;
-
-  // std::cout << "[ _pv_prev list ]" << std::endl;
-  // for (int i = 0; i < (5 < _pv_prev.size() ? 5 : _pv_prev.size()); i++) {
-  //   auto it = std::next(_pv_prev.begin(), i);
-  //   std::cout << std::fixed << std::setprecision(6) << it->first << " ";
-  // }
-  // std::cout << std::endl;
 
   assert(_pv_prev.begin()->first <= _pv_prev.rbegin()->first);
-
-  while (!(_pv_prev.empty() || (_pv_prev.begin()->first + lidar_window_size) >=
-                                   _pv_prev.rbegin()->first)) {
-    // std::cout << "[_pv_prev.front + lidar_window_size] : "
-    //           << _pv_prev.begin()->first + lidar_window_size << " < "
-    //           << _pv_prev.rbegin()->first << std::endl;
-    _pv_prev.erase(_pv_prev.begin());
-  }
 
   while (!(_pv_prev.empty() || _pv_prev.rbegin()->first < 3000000000.0)) {
     auto it = _pv_prev.end();
@@ -747,11 +757,18 @@ void LIVMapper::handleLIO() {
     _pv_prev.erase(it);
   }
 
-  double t4 = omp_get_wtime();
-
-  if (voxelmap_manager->config_setting_.map_sliding_en) {
-    voxelmap_manager->mapSliding();
+  if (!en_sliding_window_ICP) {
+    while (
+        !(_pv_prev.empty() || (_pv_prev.begin()->first + lidar_window_size) >=
+                                  _pv_prev.rbegin()->first)) {
+      // std::cout << "[_pv_prev.front + lidar_window_size] : "
+      //           << _pv_prev.begin()->first + lidar_window_size << " < "
+      //           << _pv_prev.rbegin()->first << std::endl;
+      _pv_prev.erase(_pv_prev.begin());
+    }
   }
+
+  double t4 = omp_get_wtime();
 
   if (slam_mode_ == ONLY_LIO || !mapping_after_vio) {
 
@@ -928,7 +945,10 @@ void LIVMapper::run() {
     }
     handleFirstFrame();
 
-    processImu();
+    if (!processImu()) {
+      LidarMeasures.lio_vio_flg = VIO;
+      continue;
+    }
 
     // if (!p_imu->imu_time_init) continue;
 

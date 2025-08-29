@@ -46,7 +46,7 @@ public:
   void handleVIO();
   void handleLIO();
   void savePCD();
-  void processImu();
+  bool processImu();
   void writeVIOStats(double cur_time, const Eigen::Matrix3d &rot_cov_pre,
                      const Eigen::Matrix3d &trans_cov_pre,
                      const Eigen::Matrix3d &rot_cov_post,
@@ -97,6 +97,7 @@ public:
   ros::Publisher pubImuPredictedOdom;
   bool show_imu_path = false;
   bool only_side_cam = false;
+  bool en_sliding_window_ICP = false;
 
   SLAM_MODE slam_mode_;
   std::unordered_map<VOXEL_LOCATION, VoxelOctoTree *> voxel_map;
@@ -212,6 +213,7 @@ public:
 
   LidarMeasureGroup LidarMeasures;
   StatesGroup _state;
+  StatesGroup _state_prev;
   StatesGroup state_propagat;
 
   nav_msgs::Path path;
